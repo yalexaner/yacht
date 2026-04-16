@@ -62,13 +62,13 @@
 
 ## Phase 2: Configuration
 
-- [ ] `internal/config/config.go` — `Shared` struct with common fields
-- [ ] `internal/config/web.go` — embeds `Shared`, adds web-only fields
-- [ ] `internal/config/bot.go` — embeds `Shared`, adds bot-only fields
-- [ ] Loader function reads env, returns clear errors on missing required values
-- [ ] Defaults where applicable (`DEFAULT_LANG=en`, `DEFAULT_EXPIRY_HOURS=24`, etc.)
-- [ ] Wire into both `main.go` files
-- [ ] Startup log of loaded config (mask secrets)
+- [x] `internal/config/config.go` — `Shared` struct with common fields
+- [x] `internal/config/web.go` — embeds `Shared`, adds web-only fields
+- [x] `internal/config/bot.go` — embeds `Shared`, adds bot-only fields
+- [x] Loader function reads env, returns clear errors on missing required values
+- [x] Defaults where applicable (`DEFAULT_LANG=en`, `DEFAULT_EXPIRY_HOURS=24`, etc.)
+- [x] Wire into both `main.go` files
+- [x] Startup log of loaded config (mask secrets)
 
 ---
 
