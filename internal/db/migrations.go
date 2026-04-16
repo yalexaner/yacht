@@ -36,18 +36,24 @@ const schemaMigrationsDDL = `CREATE TABLE IF NOT EXISTS schema_migrations (
 // Migrate applies every pending migration embedded at build time into the
 // given database, inside its own transaction per file, and records each
 // successful application in the schema_migrations table. Calling Migrate
-// twice on the same database is safe: the second call is a no-op.
+// twice on the same database is safe: the second call is a no-op and
+// returns 0 as the applied count.
+//
+// The returned count is the number of migrations applied by this call
+// specifically — already-applied files do not contribute. Callers typically
+// log this at INFO on startup so operators can tell at a glance whether a
+// deploy brought new schema changes.
 //
 // Migrations are sorted lexicographically by filename; the `NNN_` prefix
 // convention makes that equivalent to numerical ordering up to 999 files.
 // On the first error the call returns, wrapped with the offending filename,
 // so operators can tell exactly which migration failed in aggregated logs.
-func Migrate(ctx context.Context, db *sql.DB) error {
+func Migrate(ctx context.Context, db *sql.DB) (int, error) {
 	sub, err := fs.Sub(migrationsFS, migrationsDir)
 	if err != nil {
 		// the embedded FS is built from //go:embed above, so this should
 		// only happen if the embed directive and migrationsDir disagree.
-		return fmt.Errorf("sub migrations fs: %w", err)
+		return 0, fmt.Errorf("sub migrations fs: %w", err)
 	}
 	return migrateFS(ctx, db, sub)
 }
@@ -56,33 +62,38 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 // the migrations directory (i.e. the files are at the FS root, not under
 // a "migrations/" subpath) so that tests can substitute an fstest.MapFS
 // without having to mirror the real directory layout.
-func migrateFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+//
+// The int return mirrors Migrate: number of files this invocation actually
+// applied (i.e. excluding ones already recorded in schema_migrations).
+func migrateFS(ctx context.Context, db *sql.DB, fsys fs.FS) (int, error) {
 	if _, err := db.ExecContext(ctx, schemaMigrationsDDL); err != nil {
-		return fmt.Errorf("bootstrap schema_migrations: %w", err)
+		return 0, fmt.Errorf("bootstrap schema_migrations: %w", err)
 	}
 
 	names, err := listMigrations(fsys)
 	if err != nil {
-		return fmt.Errorf("list migrations: %w", err)
+		return 0, fmt.Errorf("list migrations: %w", err)
 	}
 
+	var applied int
 	for _, name := range names {
-		applied, err := migrationApplied(ctx, db, name)
+		already, err := migrationApplied(ctx, db, name)
 		if err != nil {
-			return fmt.Errorf("check %s: %w", name, err)
+			return applied, fmt.Errorf("check %s: %w", name, err)
 		}
-		if applied {
+		if already {
 			continue
 		}
 		body, err := fs.ReadFile(fsys, name)
 		if err != nil {
-			return fmt.Errorf("read %s: %w", name, err)
+			return applied, fmt.Errorf("read %s: %w", name, err)
 		}
 		if err := applyMigration(ctx, db, name, string(body)); err != nil {
-			return fmt.Errorf("apply %s: %w", name, err)
+			return applied, fmt.Errorf("apply %s: %w", name, err)
 		}
+		applied++
 	}
-	return nil
+	return applied, nil
 }
 
 // listMigrations returns the `.sql` filenames at the root of fsys, sorted
