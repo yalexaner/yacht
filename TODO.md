@@ -74,12 +74,12 @@
 
 ## Phase 3: Database layer
 
-- [ ] `internal/db/db.go` — open SQLite with WAL connection string
-- [ ] `internal/db/migrations.go` — embedded SQL files via `embed.FS`
-- [ ] Migration runner with `schema_migrations` tracking table
-- [ ] Migration `001_initial.sql` — all tables and indexes from SPEC
-- [ ] Both binaries call `db.Migrate(ctx)` on startup (idempotent)
-- [ ] Smoke test: run binary, verify DB file appears with correct schema (`sqlite3 meta.db .schema`)
+- [x] `internal/db/db.go` — open SQLite with WAL connection string
+- [x] `internal/db/migrations.go` — embedded SQL files via `embed.FS`
+- [x] Migration runner with `schema_migrations` tracking table
+- [x] Migration `001_initial.sql` — all tables and indexes from SPEC
+- [x] Both binaries call `db.Migrate(ctx)` on startup (idempotent)
+- [x] Smoke test: run binary, verify DB file appears with correct schema (`sqlite3 meta.db .schema`)
 
 ---
 
