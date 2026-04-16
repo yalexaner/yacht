@@ -210,6 +210,141 @@ func TestListMigrations_SortsLexicographic(t *testing.T) {
 	}
 }
 
+// TestMigrate_SchemaMatchesSPEC locks in the Task 3 transcription: after
+// Migrate runs on a fresh DB every table, column, and index called out in
+// SPEC.md § Data Model exists with the declared type. The column maps below
+// mirror SPEC verbatim — if SPEC and migration drift, this test fails with
+// a pointer to the specific table/column that doesn't line up, which is far
+// more useful than "schema is wrong" after the fact.
+func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	// expected table -> ordered column name -> declared type.
+	// order matters because PRAGMA table_info returns columns in declaration
+	// order and SPEC spells them out top-to-bottom; an out-of-order column
+	// list is a transcription bug even if every name is present.
+	type col struct {
+		name, typ string
+	}
+	tables := map[string][]col{
+		"users": {
+			{"id", "INTEGER"},
+			{"telegram_id", "INTEGER"},
+			{"telegram_username", "TEXT"},
+			{"display_name", "TEXT"},
+			{"is_admin", "INTEGER"},
+			{"created_at", "INTEGER"},
+		},
+		"shares": {
+			{"id", "TEXT"},
+			{"user_id", "INTEGER"},
+			{"kind", "TEXT"},
+			{"original_filename", "TEXT"},
+			{"mime_type", "TEXT"},
+			{"size_bytes", "INTEGER"},
+			{"text_content", "TEXT"},
+			{"storage_key", "TEXT"},
+			{"password_hash", "TEXT"},
+			{"created_at", "INTEGER"},
+			{"expires_at", "INTEGER"},
+			{"download_count", "INTEGER"},
+		},
+		"sessions": {
+			{"id", "TEXT"},
+			{"user_id", "INTEGER"},
+			{"provider", "TEXT"},
+			{"expires_at", "INTEGER"},
+			{"created_at", "INTEGER"},
+		},
+		"login_tokens": {
+			{"token", "TEXT"},
+			{"user_id", "INTEGER"},
+			{"used_at", "INTEGER"},
+			{"expires_at", "INTEGER"},
+			{"created_at", "INTEGER"},
+		},
+	}
+
+	for table, want := range tables {
+		// existence first: sqlite_master is the authoritative catalogue.
+		var name string
+		err := db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).
+			Scan(&name)
+		if err != nil {
+			t.Errorf("table %q missing from sqlite_master: %v", table, err)
+			continue
+		}
+
+		// column shape via PRAGMA table_info — returns (cid, name, type,
+		// notnull, dflt_value, pk) in declaration order. We only assert
+		// name + type here; NOT NULL / default / PK are covered implicitly
+		// by the FK-enforcement assertion below and by day-to-day queries.
+		rows, err := db.QueryContext(ctx,
+			`SELECT name, type FROM pragma_table_info(?)`, table)
+		if err != nil {
+			t.Errorf("pragma_table_info(%q): %v", table, err)
+			continue
+		}
+		var got []col
+		for rows.Next() {
+			var c col
+			if err := rows.Scan(&c.name, &c.typ); err != nil {
+				rows.Close()
+				t.Fatalf("scan table_info for %q: %v", table, err)
+			}
+			got = append(got, c)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatalf("rows.Err for %q: %v", table, err)
+		}
+		rows.Close()
+
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("table %q columns = %+v, want %+v", table, got, want)
+		}
+	}
+
+	// expiry indexes — SPEC calls out exactly three. Any drift (missing or
+	// pointed at the wrong column) will hurt cleanup-worker performance
+	// later, so lock them in by name now.
+	indexes := []string{
+		"idx_shares_expires",
+		"idx_sessions_expires",
+		"idx_login_tokens_expires",
+	}
+	for _, idx := range indexes {
+		var name string
+		err := db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx).
+			Scan(&name)
+		if err != nil {
+			t.Errorf("index %q missing from sqlite_master: %v", idx, err)
+		}
+	}
+
+	// end-to-end FK check: foreign_keys pragma is wired on every pooled
+	// connection by db.New, and the CREATE TABLE declares the FK. If
+	// either leg is broken this INSERT would silently succeed; here it
+	// must fail with a constraint error.
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO shares (id, user_id, kind, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		"no_user_", 9999, "text", 1, 2)
+	if err == nil {
+		t.Fatal("insert with missing user_id succeeded; FK not enforced")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+		t.Errorf("insert error = %v, want a foreign-key constraint error", err)
+	}
+}
+
 // TestListMigrations_FiltersNonSQL documents the exclusion rules: non-sql
 // files and sub-directories do not appear in the returned slice. This lets
 // operators drop a README.md or similar next to the migrations without
