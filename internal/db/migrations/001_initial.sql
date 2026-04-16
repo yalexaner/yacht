@@ -1,0 +1,4 @@
+-- placeholder: real schema is transcribed from SPEC.md § Data Model in Task 3
+-- of docs/plans/2026-04-16-db-layer.md. This file exists in Task 2 so that the
+-- //go:embed migrations/*.sql directive in ../migrations.go has at least one
+-- matching file and the package compiles.
