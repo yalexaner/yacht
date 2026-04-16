@@ -1,0 +1,18 @@
+# build output
+/bin/
+*.exe
+*.test
+*.out
+
+# env files (real values never committed)
+.env
+.env.*
+!.env.example
+
+# local sqlite artifacts
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
