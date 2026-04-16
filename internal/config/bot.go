@@ -58,7 +58,8 @@ func LoadBot() (*Bot, error) {
 	}
 
 	// WEBHOOK_URL is optional. When unset/empty the bot runs in long-poll
-	// mode. When set, it must parse and use an http/https scheme.
+	// mode. When set, it must parse and use an https scheme; the Telegram
+	// Bot API rejects plain http webhooks (see validateWebhookURL).
 	if v := envString("WEBHOOK_URL", ""); v != "" {
 		if err := validateWebhookURL(v); err != nil {
 			errs = append(errs, err)
@@ -74,14 +75,17 @@ func LoadBot() (*Bot, error) {
 }
 
 // validateWebhookURL returns an error when s is not a parseable URL, when
-// it lacks a host, or when its scheme is not one of http/https.
+// it lacks a host, or when its scheme is not https. The Telegram Bot API
+// rejects plain HTTP webhooks with "Bad Request: bad webhook: An HTTPS URL
+// must be provided for webhook", so enforcing https at config load surfaces
+// the misconfiguration before the bot contacts Telegram.
 func validateWebhookURL(s string) error {
 	u, err := url.Parse(s)
 	if err != nil {
 		return fmt.Errorf("env var %q: invalid URL %q: %w", "WEBHOOK_URL", s, err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("env var %q: URL %q must use http or https scheme", "WEBHOOK_URL", s)
+	if u.Scheme != "https" {
+		return fmt.Errorf("env var %q: URL %q must use https scheme (telegram rejects plain http webhooks)", "WEBHOOK_URL", s)
 	}
 	if u.Host == "" {
 		return fmt.Errorf("env var %q: URL %q is missing a host", "WEBHOOK_URL", s)

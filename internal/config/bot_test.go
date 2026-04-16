@@ -112,6 +112,7 @@ func TestLoadBot_InvalidWebhookURL(t *testing.T) {
 	}{
 		{name: "bad scheme", value: "ftp://example.com/hook", wantSub: "scheme"},
 		{name: "missing scheme", value: "example.com/hook", wantSub: "scheme"},
+		{name: "plain http rejected", value: "http://example.com/hook", wantSub: "https"},
 		{name: "missing host", value: "https://", wantSub: "host"},
 	}
 	for _, tt := range tests {
