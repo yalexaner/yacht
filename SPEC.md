@@ -80,7 +80,8 @@ Out of scope:
 
 - SQLite, single file at `/var/lib/yacht/meta.db`
 - WAL mode for concurrent access from both binaries
-- Connection string: `file:/var/lib/yacht/meta.db?_journal=WAL&_timeout=5000&_fk=true`
+- Connection string: `file:/var/lib/yacht/meta.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(true)`
+  - `modernc.org/sqlite` uses `_pragma=<name>(<value>)` query params; the mattn/go-sqlite3 shortcuts (`_journal`, `_timeout`, `_fk`) are not recognised.
 
 ### Infrastructure
 
@@ -105,12 +106,12 @@ yacht/
 │   ├── share/      # core share logic — used by both
 │   ├── storage/    # interface + local + r2 implementations
 │   ├── db/         # schema, queries, migrations
+│   │   └── migrations/ # embedded SQL files
 │   ├── auth/       # AuthProvider interface, telegram, bot-token
 │   ├── i18n/       # translations (en, ru)
 │   ├── config/     # env loading
 │   ├── bot/        # bot-specific handlers
 │   └── web/        # web-specific handlers, middleware, templates
-├── migrations/     # SQL files
 ├── web/
 │   ├── templates/
 │   └── static/     # css, small js
