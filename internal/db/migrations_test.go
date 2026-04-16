@@ -65,11 +65,15 @@ func TestMigrate_AppliesAll(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
-	if err := Migrate(ctx, db); err != nil {
+	applied, err := Migrate(ctx, db)
+	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 
 	want := embeddedMigrationCount(t)
+	if applied != want {
+		t.Errorf("Migrate returned applied=%d, want %d", applied, want)
+	}
 	got := countSchemaMigrations(t, db)
 	if got != want {
 		t.Fatalf("schema_migrations rows = %d, want %d (one per embedded file)", got, want)
@@ -98,19 +102,23 @@ func TestMigrate_AppliesAll(t *testing.T) {
 }
 
 // TestMigrate_Idempotent locks in the "safe to re-run" invariant that both
-// binaries rely on at startup: a second Migrate call neither errors nor
-// appends additional schema_migrations rows.
+// binaries rely on at startup: a second Migrate call neither errors, appends
+// additional schema_migrations rows, nor reports new applications.
 func TestMigrate_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
-	if err := Migrate(ctx, db); err != nil {
+	if _, err := Migrate(ctx, db); err != nil {
 		t.Fatalf("Migrate (first): %v", err)
 	}
 	first := countSchemaMigrations(t, db)
 
-	if err := Migrate(ctx, db); err != nil {
+	applied, err := Migrate(ctx, db)
+	if err != nil {
 		t.Fatalf("Migrate (second): %v", err)
+	}
+	if applied != 0 {
+		t.Errorf("second Migrate applied=%d, want 0 (no-op)", applied)
 	}
 	second := countSchemaMigrations(t, db)
 
@@ -126,8 +134,12 @@ func TestMigrateFS_EmptyIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
-	if err := migrateFS(ctx, db, fstest.MapFS{}); err != nil {
+	applied, err := migrateFS(ctx, db, fstest.MapFS{})
+	if err != nil {
 		t.Fatalf("migrateFS (empty): %v", err)
+	}
+	if applied != 0 {
+		t.Errorf("migrateFS on empty FS applied=%d, want 0", applied)
 	}
 
 	if n := countSchemaMigrations(t, db); n != 0 {
@@ -156,7 +168,7 @@ CREATE TABLE invalid FROM;`),
 		},
 	}
 
-	err := migrateFS(ctx, db, fsys)
+	_, err := migrateFS(ctx, db, fsys)
 	if err == nil {
 		t.Fatalf("migrateFS returned nil error, want error for bad sql")
 	}
@@ -220,7 +232,7 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 
-	if err := Migrate(ctx, db); err != nil {
+	if _, err := Migrate(ctx, db); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 
