@@ -43,25 +43,20 @@
 - [ ] Sanity check: conduwuit still running fine
 
 ### GitHub
-- [ ] Create empty repo `github.com/yalexaner/yacht`
-- [ ] Pick license (MIT for max permissiveness, AGPL-3.0 to keep forks open-source)
-- [ ] Add `.gitignore` for Go (binaries, `bin/`, `.env`, `*.db*`)
+- [x] Create empty repo `github.com/yalexaner/yacht`
+- [x] Pick license — MIT
+- [x] Add `.gitignore` for Go (binaries, `bin/`, `.env`, `*.db*`)
 
 ---
 
 ## Phase 1: Project scaffolding
 
-- [ ] `go mod init github.com/yalexaner/yacht`
-- [ ] Create directory tree:
-  - [ ] `cmd/bot/`, `cmd/web/`
-  - [ ] `internal/{share,storage,db,auth,i18n,config,bot,web}/`
-  - [ ] `migrations/`
-  - [ ] `web/{templates,static}/`
-- [ ] Stub `cmd/bot/main.go` and `cmd/web/main.go` with empty `func main() {}`
-- [ ] Verify both build: `go build ./cmd/bot && go build ./cmd/web`
-- [ ] README stub (name, one-line description, "WIP" status)
-- [ ] Commit `SPEC.md`, `TODO.md`, scaffold
-- [ ] First push to GitHub
+- [x] `go mod init github.com/yalexaner/yacht`
+- [x] README stub (name, one-line description, "WIP" status)
+- [x] Commit `SPEC.md`, `TODO.md`, scaffold
+- [x] First push to GitHub
+
+> Directory tree, `cmd/bot` and `cmd/web` stubs, and build verification were deliberately skipped — each subpackage directory is created in the phase that introduces its first real file, not as empty stubs. `cmd/bot/main.go` and `cmd/web/main.go` land in Phase 2 with config-loading content.
 
 ---
 
