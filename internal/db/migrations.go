@@ -88,10 +88,13 @@ func migrateFS(ctx context.Context, db *sql.DB, fsys fs.FS) (int, error) {
 		if err != nil {
 			return applied, fmt.Errorf("read %s: %w", name, err)
 		}
-		if err := applyMigration(ctx, db, name, string(body)); err != nil {
+		didApply, err := applyMigration(ctx, db, name, string(body))
+		if err != nil {
 			return applied, fmt.Errorf("apply %s: %w", name, err)
 		}
-		applied++
+		if didApply {
+			applied++
+		}
 	}
 	return applied, nil
 }
@@ -143,31 +146,80 @@ func migrationApplied(ctx context.Context, db *sql.DB, filename string) (bool, e
 // error the transaction rolls back — so a partially-applied migration
 // never lands in the database and schema_migrations only ever reflects
 // successfully-committed files.
-func applyMigration(ctx context.Context, db *sql.DB, filename, body string) (retErr error) {
-	tx, err := db.BeginTx(ctx, nil)
+//
+// The transaction starts with `BEGIN IMMEDIATE` (vs the stdlib default,
+// which is `BEGIN DEFERRED`) so the SQLite write lock is acquired at
+// transaction start rather than lazily on the first write. This serializes
+// migration runners across processes: when both binaries start together
+// and both see a migration as missing, the second to call BEGIN IMMEDIATE
+// blocks (up to busy_timeout) until the first commits — at which point
+// the recheck below sees the migration is now applied and the second
+// process commits an empty tx instead of re-running the DDL and exiting
+// with "table already exists". Without this, the loser of the race would
+// crash the binary at startup.
+//
+// The bool return distinguishes "this call applied the migration" from
+// "this call lost a race and observed the migration as already applied
+// after the lock came in" — only the former contributes to the applied
+// count surfaced by Migrate.
+func applyMigration(ctx context.Context, db *sql.DB, filename, body string) (applied bool, retErr error) {
+	// pin a single connection so all the statements (BEGIN IMMEDIATE, the
+	// migration body, COMMIT) land on the same SQLite session. Releasing it
+	// back to the pool only happens after the tx is resolved.
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return false, fmt.Errorf("acquire conn: %w", err)
 	}
 	defer func() {
-		if retErr == nil {
+		if cerr := conn.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("release conn: %w", cerr)
+		}
+	}()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return false, fmt.Errorf("begin immediate: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
 			return
 		}
 		// rollback errors are swallowed — the caller already has the real
 		// failure to surface, and "rolling back a failed tx failed" is not
-		// actionable separately.
-		_ = tx.Rollback()
+		// actionable separately. Use a fresh context so a cancelled parent
+		// doesn't prevent the cleanup from reaching SQLite.
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 	}()
 
-	if _, err := tx.ExecContext(ctx, body); err != nil {
-		return fmt.Errorf("exec sql: %w", err)
+	// recheck inside the write lock: another process may have applied this
+	// file between our outer migrationApplied() call and our acquiring the
+	// lock here. If so, this is the loser of the race — commit the empty
+	// tx and report not-applied so the count Migrate surfaces stays honest.
+	var one int
+	err = conn.QueryRowContext(ctx,
+		`SELECT 1 FROM schema_migrations WHERE filename = ?`, filename).Scan(&one)
+	if err == nil {
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return false, fmt.Errorf("commit after race: %w", err)
+		}
+		committed = true
+		return false, nil
 	}
-	if _, err := tx.ExecContext(ctx,
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("recheck inside lock: %w", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, body); err != nil {
+		return false, fmt.Errorf("exec sql: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx,
 		`INSERT INTO schema_migrations (filename, applied_at) VALUES (?, strftime('%s','now'))`,
 		filename); err != nil {
-		return fmt.Errorf("record in schema_migrations: %w", err)
+		return false, fmt.Errorf("record in schema_migrations: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
 	}
-	return nil
+	committed = true
+	return true, nil
 }

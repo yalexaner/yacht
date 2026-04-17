@@ -127,6 +127,72 @@ func TestMigrate_Idempotent(t *testing.T) {
 	}
 }
 
+// TestMigrate_ConcurrentSafe simulates two binaries (cmd/web and cmd/bot)
+// starting simultaneously against the same database file. Each opens its
+// own *sql.DB handle to the shared path, then both call Migrate from
+// goroutines. Without the BEGIN IMMEDIATE + recheck path in applyMigration,
+// the loser of the check-then-act race would execute a plain CREATE TABLE
+// against a schema that already exists and exit with "already exists";
+// here we assert both calls return nil, exactly the embedded count of
+// migrations land in schema_migrations, and the applied counts add up to
+// that count (i.e. each migration is recorded by exactly one runner).
+func TestMigrate_ConcurrentSafe(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "meta.db")
+
+	first, err := New(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("New (first): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := first.Close(); err != nil {
+			t.Errorf("first.Close: %v", err)
+		}
+	})
+	second, err := New(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("New (second): %v", err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("second.Close: %v", err)
+		}
+	})
+
+	type result struct {
+		applied int
+		err     error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	for _, db := range []*sql.DB{first, second} {
+		db := db
+		go func() {
+			<-start
+			n, err := Migrate(ctx, db)
+			results <- result{applied: n, err: err}
+		}()
+	}
+	close(start)
+
+	var totalApplied int
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("Migrate (concurrent runner %d): %v", i, r.err)
+		}
+		totalApplied += r.applied
+	}
+
+	want := embeddedMigrationCount(t)
+	if totalApplied != want {
+		t.Errorf("sum of applied counts = %d, want %d (each migration applied by exactly one runner)", totalApplied, want)
+	}
+	if got := countSchemaMigrations(t, first); got != want {
+		t.Errorf("schema_migrations rows = %d, want %d", got, want)
+	}
+}
+
 // TestMigrateFS_EmptyIsNoOp covers the edge case called out in Technical
 // Details: if the embedded FS is empty, Migrate should still bootstrap
 // schema_migrations (so later runs can proceed) but record zero rows.
@@ -223,11 +289,18 @@ func TestListMigrations_SortsLexicographic(t *testing.T) {
 }
 
 // TestMigrate_SchemaMatchesSPEC locks in the Task 3 transcription: after
-// Migrate runs on a fresh DB every table, column, and index called out in
-// SPEC.md § Data Model exists with the declared type. The column maps below
-// mirror SPEC verbatim — if SPEC and migration drift, this test fails with
-// a pointer to the specific table/column that doesn't line up, which is far
-// more useful than "schema is wrong" after the fact.
+// Migrate runs on a fresh DB every table, column, index, and load-bearing
+// constraint called out in SPEC.md § Data Model exists as declared. The
+// column maps below mirror SPEC verbatim — if SPEC and migration drift,
+// this test fails with a pointer to the specific table/column that doesn't
+// line up.
+//
+// Constraints we cover: column name, declared type, NOT NULL, DEFAULT, and
+// PRIMARY KEY position (via PRAGMA table_info); UNIQUE indexes (via
+// PRAGMA index_list + index_info). A transcription bug that drops e.g.
+// `UNIQUE` on users.telegram_id or `NOT NULL` on created_at would pass a
+// name+type-only check and hit production silently, so every non-trivial
+// attribute stays asserted here.
 func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -236,49 +309,58 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	// expected table -> ordered column name -> declared type.
+	// expected table -> ordered column shape.
 	// order matters because PRAGMA table_info returns columns in declaration
 	// order and SPEC spells them out top-to-bottom; an out-of-order column
 	// list is a transcription bug even if every name is present.
+	//
+	// dflt is a pointer so we can distinguish "no default" (nil) from
+	// "default is the literal string '0'" — SQLite stores DEFAULT 0 as the
+	// textual token "0" in dflt_value.
 	type col struct {
-		name, typ string
+		name    string
+		typ     string
+		notnull bool
+		dflt    *string
+		pk      int
 	}
+	strp := func(s string) *string { return &s }
 	tables := map[string][]col{
 		"users": {
-			{"id", "INTEGER"},
-			{"telegram_id", "INTEGER"},
-			{"telegram_username", "TEXT"},
-			{"display_name", "TEXT"},
-			{"is_admin", "INTEGER"},
-			{"created_at", "INTEGER"},
+			{"id", "INTEGER", false, nil, 1},
+			{"telegram_id", "INTEGER", true, nil, 0},
+			{"telegram_username", "TEXT", false, nil, 0},
+			{"display_name", "TEXT", false, nil, 0},
+			{"is_admin", "INTEGER", true, strp("0"), 0},
+			{"created_at", "INTEGER", true, nil, 0},
 		},
 		"shares": {
-			{"id", "TEXT"},
-			{"user_id", "INTEGER"},
-			{"kind", "TEXT"},
-			{"original_filename", "TEXT"},
-			{"mime_type", "TEXT"},
-			{"size_bytes", "INTEGER"},
-			{"text_content", "TEXT"},
-			{"storage_key", "TEXT"},
-			{"password_hash", "TEXT"},
-			{"created_at", "INTEGER"},
-			{"expires_at", "INTEGER"},
-			{"download_count", "INTEGER"},
+			{"id", "TEXT", false, nil, 1},
+			{"user_id", "INTEGER", true, nil, 0},
+			{"kind", "TEXT", true, nil, 0},
+			{"original_filename", "TEXT", false, nil, 0},
+			{"mime_type", "TEXT", false, nil, 0},
+			{"size_bytes", "INTEGER", false, nil, 0},
+			{"text_content", "TEXT", false, nil, 0},
+			{"storage_key", "TEXT", false, nil, 0},
+			{"password_hash", "TEXT", false, nil, 0},
+			{"created_at", "INTEGER", true, nil, 0},
+			{"expires_at", "INTEGER", true, nil, 0},
+			{"download_count", "INTEGER", true, strp("0"), 0},
 		},
 		"sessions": {
-			{"id", "TEXT"},
-			{"user_id", "INTEGER"},
-			{"provider", "TEXT"},
-			{"expires_at", "INTEGER"},
-			{"created_at", "INTEGER"},
+			{"id", "TEXT", false, nil, 1},
+			{"user_id", "INTEGER", true, nil, 0},
+			{"provider", "TEXT", true, nil, 0},
+			{"expires_at", "INTEGER", true, nil, 0},
+			{"created_at", "INTEGER", true, nil, 0},
 		},
 		"login_tokens": {
-			{"token", "TEXT"},
-			{"user_id", "INTEGER"},
-			{"used_at", "INTEGER"},
-			{"expires_at", "INTEGER"},
-			{"created_at", "INTEGER"},
+			{"token", "TEXT", false, nil, 1},
+			{"user_id", "INTEGER", true, nil, 0},
+			{"used_at", "INTEGER", false, nil, 0},
+			{"expires_at", "INTEGER", true, nil, 0},
+			{"created_at", "INTEGER", true, nil, 0},
 		},
 	}
 
@@ -294,11 +376,9 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 		}
 
 		// column shape via PRAGMA table_info — returns (cid, name, type,
-		// notnull, dflt_value, pk) in declaration order. We only assert
-		// name + type here; NOT NULL / default / PK are covered implicitly
-		// by the FK-enforcement assertion below and by day-to-day queries.
+		// notnull, dflt_value, pk) in declaration order.
 		rows, err := db.QueryContext(ctx,
-			`SELECT name, type FROM pragma_table_info(?)`, table)
+			`SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, table)
 		if err != nil {
 			t.Errorf("pragma_table_info(%q): %v", table, err)
 			continue
@@ -306,9 +386,16 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 		var got []col
 		for rows.Next() {
 			var c col
-			if err := rows.Scan(&c.name, &c.typ); err != nil {
+			var nn int
+			var dflt sql.NullString
+			if err := rows.Scan(&c.name, &c.typ, &nn, &dflt, &c.pk); err != nil {
 				rows.Close()
 				t.Fatalf("scan table_info for %q: %v", table, err)
+			}
+			c.notnull = nn != 0
+			if dflt.Valid {
+				v := dflt.String
+				c.dflt = &v
 			}
 			got = append(got, c)
 		}
@@ -321,6 +408,14 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("table %q columns = %+v, want %+v", table, got, want)
 		}
+	}
+
+	// UNIQUE on users.telegram_id — SPEC declares it, and duplicate-user
+	// prevention at the bot's /start handler depends on it. pragma_index_list
+	// returns every index on the table with a "unique" flag; we look for an
+	// entry that covers exactly telegram_id.
+	if !hasUniqueIndexOn(t, ctx, db, "users", "telegram_id") {
+		t.Errorf("users.telegram_id is not UNIQUE; duplicate-user prevention broken")
 	}
 
 	// expiry indexes — SPEC calls out exactly three. Any drift (missing or
@@ -355,6 +450,64 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 	if !strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 		t.Errorf("insert error = %v, want a foreign-key constraint error", err)
 	}
+}
+
+// hasUniqueIndexOn reports whether the given table has a UNIQUE index
+// covering exactly the single column named. Used by the schema-vs-SPEC
+// test to prove that UNIQUE constraints survive transcription.
+func hasUniqueIndexOn(t *testing.T, ctx context.Context, db *sql.DB, table, column string) bool {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `SELECT name, "unique" FROM pragma_index_list(?)`, table)
+	if err != nil {
+		t.Fatalf("pragma_index_list(%q): %v", table, err)
+	}
+	defer rows.Close()
+	type idx struct {
+		name   string
+		unique int
+	}
+	var candidates []idx
+	for rows.Next() {
+		var i idx
+		if err := rows.Scan(&i.name, &i.unique); err != nil {
+			t.Fatalf("scan index_list for %q: %v", table, err)
+		}
+		if i.unique == 1 {
+			candidates = append(candidates, i)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err on index_list for %q: %v", table, err)
+	}
+	for _, c := range candidates {
+		cols, err := indexColumns(ctx, db, c.name)
+		if err != nil {
+			t.Fatalf("pragma_index_info(%q): %v", c.name, err)
+		}
+		if len(cols) == 1 && cols[0] == column {
+			return true
+		}
+	}
+	return false
+}
+
+// indexColumns returns the column names covered by the given index, in
+// index position order.
+func indexColumns(ctx context.Context, db *sql.DB, idxName string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, idxName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
 }
 
 // TestListMigrations_FiltersNonSQL documents the exclusion rules: non-sql
