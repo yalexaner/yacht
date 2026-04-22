@@ -430,6 +430,32 @@ func (s *Service) VerifyPassword(sh *Share, plaintext string) error {
 	return nil
 }
 
+// IncrementDownloadCount atomically bumps the share's download_count by one.
+// Returns ErrNotFound (wrapped) when no row matches the ID — callers that
+// care about the distinction between "share missing" and "share present but
+// not yet incremented" can match with errors.Is.
+//
+// The UPDATE runs unconditionally on the row: expired shares still get their
+// counter bumped. Callers gate on Get (which returns ErrExpired) before
+// invoking this method, so reaching here implies the share was live when the
+// download started; a cleanup worker racing with us is a benign drift that
+// doesn't warrant special-casing here.
+func (s *Service) IncrementDownloadCount(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE shares SET download_count = download_count + 1 WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("increment %q: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("increment %q: rows affected: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("increment %q: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 // nullStringToPtr converts a sql.NullString into *string: nil when the
 // column was NULL, a fresh pointer to the string otherwise. Keeps the Scan
 // site free of boilerplate.

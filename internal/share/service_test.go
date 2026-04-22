@@ -911,3 +911,70 @@ func TestVerifyPassword_NoPassword(t *testing.T) {
 		t.Errorf("err = %v, want chain containing ErrNoPassword", err)
 	}
 }
+
+func TestIncrementDownloadCount_Once(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:  userID,
+		Content: "count me",
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+	if created.DownloadCount != 0 {
+		t.Fatalf("initial DownloadCount = %d, want 0", created.DownloadCount)
+	}
+
+	if err := svc.IncrementDownloadCount(context.Background(), created.ID); err != nil {
+		t.Fatalf("IncrementDownloadCount: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.DownloadCount != 1 {
+		t.Errorf("DownloadCount = %d, want 1", got.DownloadCount)
+	}
+}
+
+func TestIncrementDownloadCount_Twice(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:  userID,
+		Content: "count me twice",
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := svc.IncrementDownloadCount(context.Background(), created.ID); err != nil {
+			t.Fatalf("IncrementDownloadCount #%d: %v", i+1, err)
+		}
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.DownloadCount != 2 {
+		t.Errorf("DownloadCount = %d, want 2", got.DownloadCount)
+	}
+}
+
+func TestIncrementDownloadCount_Missing(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	err := svc.IncrementDownloadCount(context.Background(), "nosuchid")
+	if err == nil {
+		t.Fatal("IncrementDownloadCount err = nil, want ErrNotFound")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want chain containing ErrNotFound", err)
+	}
+}
