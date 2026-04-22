@@ -24,12 +24,21 @@ import (
 // outbound Sends so handler tests can assert on the reply payload without
 // standing up the real client, and returns caller-configured values for the
 // file-URL lookup used by the document/photo handlers (Task 6/7).
+//
+// updates is the channel Run reads from; tests pre-load it (and usually
+// close it after seeding) so Run drains the seeded updates and then exits
+// via ctx cancellation. stopCalled records whether Run invoked
+// StopReceivingUpdates on shutdown — the production lib relies on it to
+// stop the upstream poll goroutine, so a regression here would silently
+// leak a goroutine in production.
 type fakeAPI struct {
 	sent            []tgbotapi.Chattable
 	sendErr         error
 	fileURL         string
 	fileURLErr      error
 	getFileURLCalls []string
+	updates         chan tgbotapi.Update
+	stopCalled      bool
 }
 
 func (f *fakeAPI) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
@@ -46,6 +55,17 @@ func (f *fakeAPI) GetFileDirectURL(fileID string) (string, error) {
 		return "", f.fileURLErr
 	}
 	return f.fileURL, nil
+}
+
+func (f *fakeAPI) GetUpdatesChan(_ tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
+	if f.updates == nil {
+		f.updates = make(chan tgbotapi.Update)
+	}
+	return f.updates
+}
+
+func (f *fakeAPI) StopReceivingUpdates() {
+	f.stopCalled = true
 }
 
 // compile-time assertion that our fake still satisfies the narrow interface —
@@ -1103,5 +1123,67 @@ func TestHandleText_UnauthorizedSender(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("shares row count = %d, want 0", n)
+	}
+}
+
+func TestRun_HandlesUpdate(t *testing.T) {
+	tb := newTestBot(t)
+
+	// pre-load one update into a buffered channel and close it; Run will
+	// drain the seeded update, observe the closed channel, and return.
+	// Using close-then-read instead of timing a sleep keeps the test
+	// deterministic — no goroutine race between the send and the
+	// ctx-cancel path.
+	ch := make(chan tgbotapi.Update, 1)
+	ch <- tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 42},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Text: "loop-routed",
+		},
+	}
+	close(ch)
+	tb.api.updates = ch
+
+	if err := tb.bot.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(tb.api.sent) != 1 {
+		t.Fatalf("api.Send called %d times, want 1 (update was not dispatched)", len(tb.api.sent))
+	}
+	sent, ok := tb.api.sent[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatalf("sent payload = %T, want tgbotapi.MessageConfig", tb.api.sent[0])
+	}
+	if !strings.Contains(sent.Text, "Saved as text") {
+		t.Errorf("reply missing text-saved marker; got %q", sent.Text)
+	}
+	if !tb.api.stopCalled {
+		t.Error("Run returned without invoking StopReceivingUpdates (would leak the upstream poll goroutine)")
+	}
+}
+
+func TestRun_ContextCancel(t *testing.T) {
+	tb := newTestBot(t)
+
+	// unbuffered, never-closed channel: Run blocks on either side of the
+	// select, so the only way it can exit is the ctx.Done() branch. With
+	// the ctx already cancelled before Run starts, that branch wins
+	// immediately and Run returns context.Canceled.
+	tb.api.updates = make(chan tgbotapi.Update)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := tb.bot.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+	if !tb.api.stopCalled {
+		t.Error("Run returned without invoking StopReceivingUpdates")
+	}
+	if len(tb.api.sent) != 0 {
+		t.Errorf("api.Send called %d times despite no updates, want 0", len(tb.api.sent))
 	}
 }

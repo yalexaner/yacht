@@ -18,13 +18,26 @@ import (
 	"github.com/yalexaner/yacht/internal/share"
 )
 
+// longPollTimeoutSeconds is the long-poll timeout passed to GetUpdatesChan.
+// 60 s matches the upstream library's default and the practical ceiling
+// before Telegram's edge will force-close the connection — shorter values
+// just burn requests for no benefit on a low-volume personal bot.
+const longPollTimeoutSeconds = 60
+
 // telegramAPI is the narrow subset of *tgbotapi.BotAPI the bot package uses.
 // Keeping the interface small lets tests substitute a fake without standing
 // up the real Telegram API; any method added here MUST also be satisfied by
 // *tgbotapi.BotAPI (see the compile-time assertion in bot_test.go).
+//
+// GetUpdatesChan + StopReceivingUpdates land here so Run can drive long-poll
+// against a fake channel in tests without spinning the real Telegram client
+// — the production *tgbotapi.BotAPI satisfies both natively, so the prod
+// path stays unchanged.
 type telegramAPI interface {
 	Send(c tgbotapi.Chattable) (tgbotapi.Message, error)
 	GetFileDirectURL(fileID string) (string, error)
+	GetUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel
+	StopReceivingUpdates()
 }
 
 // fileDownloader abstracts the HTTP fetch of a file by direct URL. Production
@@ -54,9 +67,10 @@ type Bot struct {
 }
 
 // New constructs a Bot wired to real Telegram (and, when downloader is nil,
-// the default HTTP downloader). The full wiring lands in Task 9; this stub
-// lets dependent packages reference the constructor signature while later
-// tasks fill in user bootstrap, API construction, and the Run loop.
+// the default HTTP downloader). It contacts Telegram during construction —
+// tgbotapi.NewBotAPI issues a getMe call to populate the bot's identity —
+// so a missing or revoked TELEGRAM_BOT_TOKEN surfaces here rather than on
+// the first incoming update.
 //
 // downloader may be nil to request the default HTTP implementation; tests
 // pass an explicit fake to exercise handler behaviour without real network
@@ -69,7 +83,70 @@ func New(
 	downloader fileDownloader,
 	logger *slog.Logger,
 ) (*Bot, error) {
-	return nil, errors.New("bot.New: not yet wired")
+	api, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
+	if err != nil {
+		return nil, fmt.Errorf("bot.New: telegram client: %w", err)
+	}
+
+	admins, err := bootstrapUsers(ctx, db, cfg.TelegramAdminIDs)
+	if err != nil {
+		return nil, fmt.Errorf("bot.New: %w", err)
+	}
+
+	if downloader == nil {
+		downloader = newHTTPDownloader()
+	}
+
+	b := &Bot{
+		api:        api,
+		downloader: downloader,
+		share:      share,
+		cfg:        cfg,
+		admins:     admins,
+		logger:     logger,
+	}
+	logger.Info("bot ready",
+		"bot_id", api.Self.ID,
+		"bot_username", api.Self.UserName,
+		"admin_count", len(admins),
+	)
+	return b, nil
+}
+
+// Run drives the long-poll loop until ctx is cancelled. Each update is
+// dispatched synchronously by handleUpdate — Telegram delivers updates per
+// chat in order, and serialising the dispatch keeps replies for the same
+// sender in the right order without a per-chat mutex. A misbehaving handler
+// blocking the loop would be a bigger smell than the throughput cost, since
+// the bot is sized for one human operator, not a fan-in firehose.
+//
+// On ctx cancellation we call StopReceivingUpdates so the underlying
+// goroutine inside the tgbotapi library closes the updates channel and
+// exits cleanly; without it the goroutine would keep polling Telegram
+// after Run returns. We return ctx.Err() so callers can distinguish
+// cancellation from a real failure and log accordingly.
+func (b *Bot) Run(ctx context.Context) error {
+	cfg := tgbotapi.NewUpdate(0)
+	cfg.Timeout = longPollTimeoutSeconds
+
+	updates := b.api.GetUpdatesChan(cfg)
+	defer b.api.StopReceivingUpdates()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case update, ok := <-updates:
+			if !ok {
+				// channel closed (StopReceivingUpdates was called from
+				// elsewhere, or the upstream goroutine exited). Treat as
+				// a cancellation rather than a silent loop exit so the
+				// caller logs the shutdown.
+				return ctx.Err()
+			}
+			b.handleUpdate(ctx, update)
+		}
+	}
 }
 
 // handleUpdate is the per-update dispatcher: filter noise, enforce auth, route
