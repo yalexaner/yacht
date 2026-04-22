@@ -122,14 +122,14 @@
 
 ## Phase 6: Bot binary — minimum viable
 
-- [ ] `internal/bot/bot.go` — bot struct, deps wiring
-- [ ] Long-poll loop (webhook mode deferred)
-- [ ] Handler: incoming document → download from Telegram → `share.CreateFileShare` → reply with URL
-- [ ] Handler: incoming photo → same flow with photo file IDs
-- [ ] Handler: incoming text message → `share.CreateTextShare` → reply with URL
-- [ ] Handler: `/start` → friendly greeting
-- [ ] Handler: `/help` → usage instructions
-- [ ] Auth check: only `TELEGRAM_ADMIN_IDS` allowed (full allowlist comes in Phase 12)
+- [x] `internal/bot/bot.go` — bot struct, deps wiring
+- [x] Long-poll loop (webhook mode deferred)
+- [x] Handler: incoming document → download from Telegram → `share.CreateFileShare` → reply with URL
+- [x] Handler: incoming photo → same flow with photo file IDs
+- [x] Handler: incoming text message → `share.CreateTextShare` → reply with URL
+- [x] Handler: `/start` → friendly greeting
+- [x] Handler: `/help` → usage instructions
+- [x] Auth check: only `TELEGRAM_ADMIN_IDS` allowed (full allowlist comes in Phase 12)
 - [ ] Manual test: send file from phone, verify storage + DB row
 - [ ] Manual test: send text, verify URL persisted (will 404 until Phase 7)
 
