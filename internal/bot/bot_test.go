@@ -1,8 +1,11 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,7 +15,63 @@ import (
 
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
+	"github.com/yalexaner/yacht/internal/share"
+	"github.com/yalexaner/yacht/internal/storage/local"
 )
+
+// fakeAPI is the test substitute for the real *tgbotapi.BotAPI. It captures
+// outbound Sends so handler tests can assert on the reply payload without
+// standing up the real client, and returns caller-configured values for the
+// file-URL lookup used by the document/photo handlers (Task 6/7).
+type fakeAPI struct {
+	sent            []tgbotapi.Chattable
+	sendErr         error
+	fileURL         string
+	fileURLErr      error
+	getFileURLCalls []string
+}
+
+func (f *fakeAPI) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
+	f.sent = append(f.sent, c)
+	if f.sendErr != nil {
+		return tgbotapi.Message{}, f.sendErr
+	}
+	return tgbotapi.Message{}, nil
+}
+
+func (f *fakeAPI) GetFileDirectURL(fileID string) (string, error) {
+	f.getFileURLCalls = append(f.getFileURLCalls, fileID)
+	if f.fileURLErr != nil {
+		return "", f.fileURLErr
+	}
+	return f.fileURL, nil
+}
+
+// compile-time assertion that our fake still satisfies the narrow interface —
+// a regression here means the interface grew a method the fake doesn't
+// implement, which would silently let tests that don't exercise the new
+// method pass with a misleading stub.
+var _ telegramAPI = (*fakeAPI)(nil)
+
+// fakeDownloader serves caller-configured bytes with zero network I/O. The
+// calls slice lets tests assert which URLs the handler asked to download
+// (useful for document/photo tests that need to verify size-guard short-
+// circuits skipped the fetch entirely).
+type fakeDownloader struct {
+	body  []byte
+	err   error
+	calls []string
+}
+
+func (f *fakeDownloader) Download(_ context.Context, url string) (io.ReadCloser, int64, error) {
+	f.calls = append(f.calls, url)
+	if f.err != nil {
+		return nil, 0, f.err
+	}
+	return io.NopCloser(bytes.NewReader(f.body)), int64(len(f.body)), nil
+}
+
+var _ fileDownloader = (*fakeDownloader)(nil)
 
 // compile-time assertion that the real Telegram API satisfies our narrow
 // interface — a regression here (e.g. a breaking upstream rename of Send or
@@ -235,5 +294,198 @@ func TestHandleHelp_MentionsAdminFuture(t *testing.T) {
 	}
 	if !strings.Contains(reply.Text, "/allow") {
 		t.Errorf("reply.Text missing /allow reference; got %q", reply.Text)
+	}
+}
+
+// testBot bundles everything a share-creating handler test needs to drive the
+// bot and verify the side effects: the bot itself, the captured fakes, the
+// DB handle for table inspection, and the Telegram ID registered as an admin
+// (so tests can build messages that pass the admin-map lookup).
+type testBot struct {
+	bot      *Bot
+	api      *fakeAPI
+	dl       *fakeDownloader
+	db       *sql.DB
+	adminTG  int64
+	adminRow int64
+}
+
+// newTestBot wires a Bot around a real share.Service (temp SQLite + local
+// storage root under t.TempDir) plus fake Telegram I/O and an io.Discard
+// logger. Parallel to share.newTestService — same real-deps-for-data-access,
+// fakes-for-I/O split — so handler tests exercise the full persistence path
+// without depending on a real Telegram connection.
+func newTestBot(t *testing.T) *testBot {
+	t.Helper()
+
+	ctx := context.Background()
+	handle := newTestDB(t)
+
+	backend, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+
+	cfg := &config.Bot{
+		Shared: &config.Shared{
+			BaseURL:        "https://yacht.example",
+			DefaultExpiry:  24 * time.Hour,
+			MaxUploadBytes: 10 * 1024 * 1024,
+		},
+	}
+	svc := share.New(handle, backend, cfg.Shared)
+
+	const adminTG = int64(77777)
+	admins, err := bootstrapUsers(ctx, handle, []int64{adminTG})
+	if err != nil {
+		t.Fatalf("bootstrapUsers: %v", err)
+	}
+
+	api := &fakeAPI{}
+	dl := &fakeDownloader{}
+
+	b := &Bot{
+		api:        api,
+		downloader: dl,
+		share:      svc,
+		cfg:        cfg,
+		admins:     admins,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return &testBot{
+		bot:      b,
+		api:      api,
+		dl:       dl,
+		db:       handle,
+		adminTG:  adminTG,
+		adminRow: admins[adminTG],
+	}
+}
+
+// newAdminMessage builds a message authored by the test admin with the given
+// chat ID and text. Handlers that go deeper (document/photo) override the
+// returned message to add Document / Photo payloads.
+func newAdminMessage(tb *testBot, chatID int64, text string) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: chatID},
+		From: &tgbotapi.User{ID: tb.adminTG},
+		Text: text,
+	}
+}
+
+func TestHandleText_HappyPath(t *testing.T) {
+	tb := newTestBot(t)
+
+	reply, err := tb.bot.handleText(context.Background(), newAdminMessage(tb, 42, "hello"))
+	if err != nil {
+		t.Fatalf("handleText: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "Saved as text") {
+		t.Errorf("reply.Text missing text-saved marker; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/") {
+		t.Errorf("reply.Text missing URL prefix; got %q", reply.Text)
+	}
+
+	var (
+		content string
+		kind    string
+	)
+	err = tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT kind, text_content FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&kind, &content)
+	if err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if kind != share.KindText {
+		t.Errorf("stored kind = %q, want %q", kind, share.KindText)
+	}
+	if content != "hello" {
+		t.Errorf("stored text_content = %q, want %q", content, "hello")
+	}
+}
+
+func TestHandleText_EmptyText(t *testing.T) {
+	tb := newTestBot(t)
+
+	reply, err := tb.bot.handleText(context.Background(), newAdminMessage(tb, 42, ""))
+	if err != nil {
+		t.Fatalf("handleText: %v", err)
+	}
+	if reply.ChatID != 0 || reply.Text != "" {
+		t.Errorf("want zero-value MessageConfig, got ChatID=%d text=%q", reply.ChatID, reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (empty text must not persist)", n)
+	}
+}
+
+func TestHandleText_ShareCreationError(t *testing.T) {
+	tb := newTestBot(t)
+
+	// force CreateTextShare to fail by closing the DB handle before the
+	// handler call. CreateTextShare will fail at the allocateShareID SELECT
+	// or the subsequent INSERT with an "sql: database is closed" error.
+	if err := tb.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	reply, err := tb.bot.handleText(context.Background(), newAdminMessage(tb, 42, "hello"))
+	if err != nil {
+		t.Fatalf("handleText: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+}
+
+func TestHandleText_UnauthorizedSender(t *testing.T) {
+	tb := newTestBot(t)
+
+	// defense-in-depth: the dispatcher should filter unauthorized senders
+	// before they reach this handler, but the handler is expected to no-op
+	// if one sneaks through. Lock that in so a routing change can't leak
+	// writes into the DB via this path.
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG + 1},
+		Text: "hello",
+	}
+
+	reply, err := tb.bot.handleText(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleText: %v", err)
+	}
+	if reply.ChatID != 0 || reply.Text != "" {
+		t.Errorf("want zero-value MessageConfig, got ChatID=%d text=%q", reply.ChatID, reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0", n)
 	}
 }
