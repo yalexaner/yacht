@@ -1,14 +1,20 @@
 package share
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
+	"github.com/yalexaner/yacht/internal/storage"
 	"github.com/yalexaner/yacht/internal/storage/local"
 )
 
@@ -81,5 +87,266 @@ func TestNew_Constructor(t *testing.T) {
 	}
 	if svc.cfg == nil || svc.cfg.DefaultExpiry != 24*time.Hour {
 		t.Errorf("Service.cfg.DefaultExpiry = %v, want 24h", svc.cfg.DefaultExpiry)
+	}
+}
+
+// newServiceWithStorage builds a Service using a caller-provided storage
+// backend so tests that need to simulate storage failures can swap in a
+// stub. The db wiring matches newTestService exactly.
+func newServiceWithStorage(t *testing.T, backend storage.Storage) (*Service, *sql.DB) {
+	t.Helper()
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "meta.db")
+	handle, err := db.New(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	t.Cleanup(func() { handle.Close() })
+
+	if _, err := db.Migrate(ctx, handle); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+
+	cfg := &config.Shared{DefaultExpiry: 24 * time.Hour}
+	return New(handle, backend, cfg), handle
+}
+
+// failingStorage implements storage.Storage but rejects every Put with a
+// canned error. TestCreateFileShare_StorageFailurePreventsDBInsert uses this
+// to lock in the upload-then-insert ordering contract: if the upload fails,
+// the DB row must not exist.
+type failingStorage struct {
+	putErr error
+}
+
+func (f *failingStorage) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
+	return f.putErr
+}
+
+func (f *failingStorage) Get(ctx context.Context, key string) (io.ReadCloser, *storage.ObjectInfo, error) {
+	return nil, nil, storage.ErrNotFound
+}
+
+func (f *failingStorage) Delete(ctx context.Context, key string) error {
+	return storage.ErrNotFound
+}
+
+func TestCreateFileShare_HappyPath(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	payload := []byte("hello yacht")
+	before := time.Now()
+	got, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "hello.txt",
+		MIMEType:         "text/plain",
+		Size:             int64(len(payload)),
+		Content:          bytes.NewReader(payload),
+	})
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	if len(got.ID) != shareIDLength {
+		t.Errorf("ID length = %d, want %d", len(got.ID), shareIDLength)
+	}
+	if got.Kind != KindFile {
+		t.Errorf("Kind = %q, want %q", got.Kind, KindFile)
+	}
+	if got.UserID != userID {
+		t.Errorf("UserID = %d, want %d", got.UserID, userID)
+	}
+	if got.OriginalFilename == nil || *got.OriginalFilename != "hello.txt" {
+		t.Errorf("OriginalFilename = %v, want \"hello.txt\"", got.OriginalFilename)
+	}
+	if got.MIMEType == nil || *got.MIMEType != "text/plain" {
+		t.Errorf("MIMEType = %v, want \"text/plain\"", got.MIMEType)
+	}
+	if got.SizeBytes == nil || *got.SizeBytes != int64(len(payload)) {
+		t.Errorf("SizeBytes = %v, want %d", got.SizeBytes, len(payload))
+	}
+	if got.StorageKey == nil || *got.StorageKey != got.ID {
+		t.Errorf("StorageKey = %v, want %q", got.StorageKey, got.ID)
+	}
+	if got.PasswordHash != nil {
+		t.Errorf("PasswordHash = %v, want nil (empty password)", got.PasswordHash)
+	}
+	if got.TextContent != nil {
+		t.Errorf("TextContent = %v, want nil (file share)", got.TextContent)
+	}
+	if got.DownloadCount != 0 {
+		t.Errorf("DownloadCount = %d, want 0", got.DownloadCount)
+	}
+	// allow a small tolerance because the Service records now in one call and
+	// the test samples it on either side of that call.
+	wantExp := before.Add(24 * time.Hour)
+	if got.ExpiresAt.Before(wantExp.Add(-2*time.Second)) || got.ExpiresAt.After(after.Add(24*time.Hour).Add(2*time.Second)) {
+		t.Errorf("ExpiresAt = %v, want ≈ now+24h", got.ExpiresAt)
+	}
+
+	// row exists in the DB with the expected primary columns
+	var (
+		dbID, dbKind string
+		dbSize       int64
+	)
+	err = handle.QueryRowContext(context.Background(),
+		`SELECT id, kind, size_bytes FROM shares WHERE id = ?`, got.ID,
+	).Scan(&dbID, &dbKind, &dbSize)
+	if err != nil {
+		t.Fatalf("select back: %v", err)
+	}
+	if dbID != got.ID || dbKind != KindFile || dbSize != int64(len(payload)) {
+		t.Errorf("db row = (%q,%q,%d), want (%q,%q,%d)", dbID, dbKind, dbSize, got.ID, KindFile, len(payload))
+	}
+
+	// storage has the uploaded bytes at key == ID
+	rc, _, err := svc.storage.Get(context.Background(), got.ID)
+	if err != nil {
+		t.Fatalf("storage.Get: %v", err)
+	}
+	defer rc.Close()
+	read, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Errorf("storage payload = %q, want %q", read, payload)
+	}
+}
+
+func TestCreateFileShare_WithPassword(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	got, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	if got.PasswordHash == nil {
+		t.Fatal("PasswordHash = nil, want non-nil")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*got.PasswordHash), []byte("hunter2")); err != nil {
+		t.Errorf("bcrypt.CompareHashAndPassword: %v (hash does not validate)", err)
+	}
+}
+
+func TestCreateFileShare_ExplicitExpiry(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	before := time.Now()
+	got, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "a.txt",
+		MIMEType:         "text/plain",
+		Size:             1,
+		Content:          bytes.NewReader([]byte("a")),
+		Expiry:           2 * time.Hour,
+	})
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	wantLow := before.Add(2 * time.Hour).Add(-2 * time.Second)
+	wantHigh := after.Add(2 * time.Hour).Add(2 * time.Second)
+	if got.ExpiresAt.Before(wantLow) || got.ExpiresAt.After(wantHigh) {
+		t.Errorf("ExpiresAt = %v, want ≈ now+2h (not DefaultExpiry=24h)", got.ExpiresAt)
+	}
+}
+
+func TestCreateFileShare_ValidatesInput(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	base := func() CreateFileOpts {
+		return CreateFileOpts{
+			UserID:           userID,
+			OriginalFilename: "x.txt",
+			MIMEType:         "text/plain",
+			Size:             1,
+			Content:          bytes.NewReader([]byte("x")),
+		}
+	}
+
+	cases := []struct {
+		name  string
+		mutate func(*CreateFileOpts)
+	}{
+		{
+			name:   "nil content",
+			mutate: func(o *CreateFileOpts) { o.Content = nil },
+		},
+		{
+			name:   "negative size",
+			mutate: func(o *CreateFileOpts) { o.Size = -1 },
+		},
+		{
+			name:   "zero user id",
+			mutate: func(o *CreateFileOpts) { o.UserID = 0 },
+		},
+		{
+			name:   "empty filename",
+			mutate: func(o *CreateFileOpts) { o.OriginalFilename = "" },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := base()
+			tc.mutate(&opts)
+			got, err := svc.CreateFileShare(context.Background(), opts)
+			if err == nil {
+				t.Fatalf("CreateFileShare(%s) err = nil, want non-nil", tc.name)
+			}
+			if got != nil {
+				t.Errorf("CreateFileShare(%s) share = %+v, want nil", tc.name, got)
+			}
+		})
+	}
+}
+
+func TestCreateFileShare_StorageFailurePreventsDBInsert(t *testing.T) {
+	stubErr := errors.New("stub put failure")
+	svc, handle := newServiceWithStorage(t, &failingStorage{putErr: stubErr})
+	userID := insertTestUser(t, handle)
+
+	got, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "x.txt",
+		MIMEType:         "text/plain",
+		Size:             1,
+		Content:          bytes.NewReader([]byte("x")),
+	})
+	if err == nil {
+		t.Fatal("CreateFileShare err = nil, want storage failure")
+	}
+	if !errors.Is(err, stubErr) {
+		t.Errorf("err = %v, want chain containing stubErr", err)
+	}
+	if got != nil {
+		t.Errorf("share = %+v, want nil", got)
+	}
+
+	// no row in the DB — locks in the upload-then-insert ordering
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM shares WHERE user_id = ?`, userID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("share rows after failed upload = %d, want 0", count)
 	}
 }

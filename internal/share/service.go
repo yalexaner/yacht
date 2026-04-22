@@ -19,14 +19,26 @@
 package share
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"time"
+
+	gonanoid "github.com/matoous/go-nanoid/v2"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/storage"
 )
+
+// shareIDLength is the number of characters in a generated share ID. Eight
+// characters of the nanoid default URL-safe alphabet (64 symbols) is ~47
+// bits of entropy — at personal scale the birthday-collision probability
+// remains effectively zero for the lifetime of the service, and the IDs are
+// short enough to fit comfortably into URLs and Telegram captions.
+const shareIDLength = 8
 
 // Kind values written to the shares.kind column. Callers compare Share.Kind
 // against these constants rather than string literals.
@@ -123,3 +135,114 @@ var ErrPasswordMismatch = errors.New("share: password mismatch")
 // shouldn't invoke VerifyPassword on such a share — receiving this error
 // signals a caller-side control-flow bug. Match with errors.Is.
 var ErrNoPassword = errors.New("share: no password set")
+
+// newShareID returns a fresh 8-char share ID using the nanoid default URL-safe
+// alphabet. Isolated so tests and future callers can swap in a deterministic
+// generator without touching the CreateShare code paths.
+func newShareID() (string, error) {
+	id, err := gonanoid.New(shareIDLength)
+	if err != nil {
+		return "", fmt.Errorf("generate share id: %w", err)
+	}
+	return id, nil
+}
+
+// hashPassword returns a bcrypt hash of plaintext wrapped in a pointer, or
+// (nil, nil) when plaintext is empty (the share has no password). bcrypt's
+// DefaultCost=10 is the library's recommended default — fast enough on a
+// small VPS to be unnoticeable per request, slow enough to make offline
+// brute-force of leaked hashes costly.
+func hashPassword(plaintext string) (*string, error) {
+	if plaintext == "" {
+		return nil, nil
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+	s := string(h)
+	return &s, nil
+}
+
+// CreateFileShare uploads opts.Content to the storage backend, persists a
+// metadata row in the shares table, and returns a fully-hydrated *Share for
+// the caller to build URLs / log / respond with. The returned ID is the
+// same value used as the storage key (flat, no prefix — see SPEC).
+//
+// Upload-then-insert order: the object is written to storage BEFORE the
+// database row is inserted. If the insert fails, the object is orphaned in
+// storage; Phase 8's cleanup worker garbage-collects it by walking expired
+// shares. The alternative (insert-then-upload) would produce DB rows
+// without backing bytes, which surfaces on Get → OpenContent as
+// storage.ErrNotFound — indistinguishable from actual data loss. Tolerating
+// orphans is the better failure mode.
+func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Share, error) {
+	if opts.Content == nil {
+		return nil, fmt.Errorf("create file share: content reader is nil")
+	}
+	if opts.Size < 0 {
+		return nil, fmt.Errorf("create file share: negative size %d", opts.Size)
+	}
+	if opts.UserID == 0 {
+		return nil, fmt.Errorf("create file share: user id is zero")
+	}
+	if opts.OriginalFilename == "" {
+		return nil, fmt.Errorf("create file share: original filename is empty")
+	}
+
+	// zero Expiry means "use cfg default"; a non-zero Expiry lets callers
+	// override per-share without mutating shared config.
+	expiry := opts.Expiry
+	if expiry == 0 {
+		expiry = s.cfg.DefaultExpiry
+	}
+
+	id, err := newShareID()
+	if err != nil {
+		return nil, fmt.Errorf("create file share: %w", err)
+	}
+
+	passwordHash, err := hashPassword(opts.Password)
+	if err != nil {
+		return nil, fmt.Errorf("create file share: %w", err)
+	}
+
+	if err := s.storage.Put(ctx, id, opts.Content, opts.Size, opts.MIMEType); err != nil {
+		return nil, fmt.Errorf("create file share: upload: %w", err)
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(expiry)
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO shares
+			(id, user_id, kind, original_filename, mime_type, size_bytes,
+			 storage_key, password_hash, created_at, expires_at, download_count)
+		VALUES (?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, 0)
+	`, id, opts.UserID, opts.OriginalFilename, opts.MIMEType, opts.Size,
+		id, passwordHash, now.Unix(), expiresAt.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("create file share: insert: %w", err)
+	}
+
+	// re-hydrate locally rather than SELECT — every field was just written, so
+	// a round-trip would only re-pay the integer->time conversion without
+	// catching any bug that the INSERT alone wouldn't surface first.
+	filename := opts.OriginalFilename
+	mime := opts.MIMEType
+	size := opts.Size
+	storageKey := id
+	return &Share{
+		ID:               id,
+		UserID:           opts.UserID,
+		Kind:             KindFile,
+		OriginalFilename: &filename,
+		MIMEType:         &mime,
+		SizeBytes:        &size,
+		StorageKey:       &storageKey,
+		PasswordHash:     passwordHash,
+		CreatedAt:        time.Unix(now.Unix(), 0).UTC(),
+		ExpiresAt:        time.Unix(expiresAt.Unix(), 0).UTC(),
+		DownloadCount:    0,
+	}, nil
+}
