@@ -317,6 +317,154 @@ func TestCreateFileShare_ValidatesInput(t *testing.T) {
 	}
 }
 
+func TestCreateTextShare_HappyPath(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	content := "some secret memo"
+	before := time.Now()
+	got, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:  userID,
+		Content: content,
+	})
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	if len(got.ID) != shareIDLength {
+		t.Errorf("ID length = %d, want %d", len(got.ID), shareIDLength)
+	}
+	if got.Kind != KindText {
+		t.Errorf("Kind = %q, want %q", got.Kind, KindText)
+	}
+	if got.UserID != userID {
+		t.Errorf("UserID = %d, want %d", got.UserID, userID)
+	}
+	if got.TextContent == nil || *got.TextContent != content {
+		t.Errorf("TextContent = %v, want %q", got.TextContent, content)
+	}
+	if got.StorageKey != nil {
+		t.Errorf("StorageKey = %v, want nil (text share)", got.StorageKey)
+	}
+	if got.OriginalFilename != nil {
+		t.Errorf("OriginalFilename = %v, want nil (text share)", got.OriginalFilename)
+	}
+	if got.MIMEType != nil {
+		t.Errorf("MIMEType = %v, want nil (text share)", got.MIMEType)
+	}
+	if got.SizeBytes != nil {
+		t.Errorf("SizeBytes = %v, want nil (text share)", got.SizeBytes)
+	}
+	if got.PasswordHash != nil {
+		t.Errorf("PasswordHash = %v, want nil (empty password)", got.PasswordHash)
+	}
+	if got.DownloadCount != 0 {
+		t.Errorf("DownloadCount = %d, want 0", got.DownloadCount)
+	}
+	wantExp := before.Add(24 * time.Hour)
+	if got.ExpiresAt.Before(wantExp.Add(-2*time.Second)) || got.ExpiresAt.After(after.Add(24*time.Hour).Add(2*time.Second)) {
+		t.Errorf("ExpiresAt = %v, want ≈ now+24h", got.ExpiresAt)
+	}
+
+	// row exists with the expected shape: kind=text, text_content set,
+	// file-only columns NULL.
+	var (
+		dbKind        string
+		dbText        sql.NullString
+		dbStorageKey  sql.NullString
+		dbFilename    sql.NullString
+		dbMIMEType    sql.NullString
+		dbSize        sql.NullInt64
+	)
+	err = handle.QueryRowContext(context.Background(),
+		`SELECT kind, text_content, storage_key, original_filename, mime_type, size_bytes
+		 FROM shares WHERE id = ?`, got.ID,
+	).Scan(&dbKind, &dbText, &dbStorageKey, &dbFilename, &dbMIMEType, &dbSize)
+	if err != nil {
+		t.Fatalf("select back: %v", err)
+	}
+	if dbKind != KindText {
+		t.Errorf("db kind = %q, want %q", dbKind, KindText)
+	}
+	if !dbText.Valid || dbText.String != content {
+		t.Errorf("db text_content = %v, want %q", dbText, content)
+	}
+	if dbStorageKey.Valid {
+		t.Errorf("db storage_key = %q, want NULL", dbStorageKey.String)
+	}
+	if dbFilename.Valid {
+		t.Errorf("db original_filename = %q, want NULL", dbFilename.String)
+	}
+	if dbMIMEType.Valid {
+		t.Errorf("db mime_type = %q, want NULL", dbMIMEType.String)
+	}
+	if dbSize.Valid {
+		t.Errorf("db size_bytes = %d, want NULL", dbSize.Int64)
+	}
+}
+
+func TestCreateTextShare_WithPassword(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	got, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:   userID,
+		Content:  "top secret",
+		Password: "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	if got.PasswordHash == nil {
+		t.Fatal("PasswordHash = nil, want non-nil")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(*got.PasswordHash), []byte("hunter2")); err != nil {
+		t.Errorf("bcrypt.CompareHashAndPassword: %v (hash does not validate)", err)
+	}
+}
+
+func TestCreateTextShare_ValidatesInput(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	base := func() CreateTextOpts {
+		return CreateTextOpts{
+			UserID:  userID,
+			Content: "hi",
+		}
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*CreateTextOpts)
+	}{
+		{
+			name:   "empty content",
+			mutate: func(o *CreateTextOpts) { o.Content = "" },
+		},
+		{
+			name:   "zero user id",
+			mutate: func(o *CreateTextOpts) { o.UserID = 0 },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := base()
+			tc.mutate(&opts)
+			got, err := svc.CreateTextShare(context.Background(), opts)
+			if err == nil {
+				t.Fatalf("CreateTextShare(%s) err = nil, want non-nil", tc.name)
+			}
+			if got != nil {
+				t.Errorf("CreateTextShare(%s) share = %+v, want nil", tc.name, got)
+			}
+		})
+	}
+}
+
 func TestCreateFileShare_StorageFailurePreventsDBInsert(t *testing.T) {
 	stubErr := errors.New("stub put failure")
 	svc, handle := newServiceWithStorage(t, &failingStorage{putErr: stubErr})

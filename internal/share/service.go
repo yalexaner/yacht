@@ -246,3 +246,62 @@ func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Sh
 		DownloadCount:    0,
 	}, nil
 }
+
+// CreateTextShare persists a text snippet as a share. Unlike CreateFileShare
+// there is no storage backend call — the payload lives in the shares.text_content
+// column directly. storage_key, original_filename, mime_type, and size_bytes
+// are all NULL for text shares; OpenContent serves the bytes from memory.
+//
+// This keeps small text snippets cheap to store and read: no object round-trip,
+// no GC concerns, and the DB already provides atomicity between metadata and
+// payload.
+func (s *Service) CreateTextShare(ctx context.Context, opts CreateTextOpts) (*Share, error) {
+	if opts.UserID == 0 {
+		return nil, fmt.Errorf("create text share: user id is zero")
+	}
+	if opts.Content == "" {
+		return nil, fmt.Errorf("create text share: content is empty")
+	}
+
+	// zero Expiry means "use cfg default"; a non-zero Expiry lets callers
+	// override per-share without mutating shared config.
+	expiry := opts.Expiry
+	if expiry == 0 {
+		expiry = s.cfg.DefaultExpiry
+	}
+
+	id, err := newShareID()
+	if err != nil {
+		return nil, fmt.Errorf("create text share: %w", err)
+	}
+
+	passwordHash, err := hashPassword(opts.Password)
+	if err != nil {
+		return nil, fmt.Errorf("create text share: %w", err)
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(expiry)
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO shares
+			(id, user_id, kind, text_content, password_hash,
+			 created_at, expires_at, download_count)
+		VALUES (?, ?, 'text', ?, ?, ?, ?, 0)
+	`, id, opts.UserID, opts.Content, passwordHash, now.Unix(), expiresAt.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("create text share: insert: %w", err)
+	}
+
+	content := opts.Content
+	return &Share{
+		ID:            id,
+		UserID:        opts.UserID,
+		Kind:          KindText,
+		TextContent:   &content,
+		PasswordHash:  passwordHash,
+		CreatedAt:     time.Unix(now.Unix(), 0).UTC(),
+		ExpiresAt:     time.Unix(expiresAt.Unix(), 0).UTC(),
+		DownloadCount: 0,
+	}, nil
+}
