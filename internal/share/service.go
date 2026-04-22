@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	gonanoid "github.com/matoous/go-nanoid/v2"
@@ -364,6 +365,43 @@ func (s *Service) Get(ctx context.Context, id string) (*Share, error) {
 		return nil, fmt.Errorf("get %q: %w", id, ErrExpired)
 	}
 	return &share, nil
+}
+
+// OpenContent returns a reader for the share's payload. For a file share the
+// reader streams from the storage backend; for a text share it wraps the
+// in-memory text_content column with io.NopCloser. Callers are responsible
+// for closing the returned reader.
+//
+// Storage-layer ErrNotFound on a file share is forwarded unchanged rather
+// than being translated into share.ErrNotFound. A missing object when the
+// database row exists means storage and the DB are out of sync — a different
+// failure mode from "this share was never created" (ErrNotFound on Get) or
+// "this share lapsed" (ErrExpired on Get). Blurring the two would rob
+// operators of the signal they need to spot drift between the two systems.
+//
+// Unknown Kind values are a should-never-happen: Kind is only written by
+// CreateFileShare and CreateTextShare, and both use the package constants.
+// The branch exists as defense-in-depth so a corrupt row produces a clear
+// error rather than a nil-dereference panic on the pointer fields.
+func (s *Service) OpenContent(ctx context.Context, sh *Share) (io.ReadCloser, error) {
+	switch sh.Kind {
+	case KindFile:
+		if sh.StorageKey == nil {
+			return nil, fmt.Errorf("open content %q: file share has nil storage key", sh.ID)
+		}
+		rc, _, err := s.storage.Get(ctx, *sh.StorageKey)
+		if err != nil {
+			return nil, fmt.Errorf("open content %q: %w", sh.ID, err)
+		}
+		return rc, nil
+	case KindText:
+		if sh.TextContent == nil {
+			return nil, fmt.Errorf("open content %q: text share has nil text content", sh.ID)
+		}
+		return io.NopCloser(strings.NewReader(*sh.TextContent)), nil
+	default:
+		return nil, fmt.Errorf("open content %q: unknown kind %q", sh.ID, sh.Kind)
+	}
 }
 
 // nullStringToPtr converts a sql.NullString into *string: nil when the

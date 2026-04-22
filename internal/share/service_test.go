@@ -707,3 +707,122 @@ func TestGet_ExpiresAtBoundary(t *testing.T) {
 		t.Errorf("share = %+v, want nil", got)
 	}
 }
+
+func TestOpenContent_FileShare(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	payload := []byte("open-content payload")
+	created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "blob.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             int64(len(payload)),
+		Content:          bytes.NewReader(payload),
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	rc, err := svc.OpenContent(context.Background(), got)
+	if err != nil {
+		t.Fatalf("OpenContent: %v", err)
+	}
+	defer rc.Close()
+
+	read, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Errorf("payload = %q, want %q", read, payload)
+	}
+}
+
+func TestOpenContent_TextShare(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	content := "inline text body"
+	created, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:  userID,
+		Content: content,
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	rc, err := svc.OpenContent(context.Background(), got)
+	if err != nil {
+		t.Fatalf("OpenContent: %v", err)
+	}
+	defer rc.Close()
+
+	read, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(read) != content {
+		t.Errorf("content = %q, want %q", read, content)
+	}
+}
+
+func TestOpenContent_FileStorageMissing(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "ghost.txt",
+		MIMEType:         "text/plain",
+		Size:             3,
+		Content:          bytes.NewReader([]byte("abc")),
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	// simulate db/storage drift: the row is still there but the backing object
+	// has been removed out-of-band (e.g. a stray cleanup script). OpenContent
+	// must surface storage.ErrNotFound so operators can distinguish this from
+	// share.ErrNotFound (which means the share row itself doesn't exist).
+	if err := svc.storage.Delete(context.Background(), *created.StorageKey); err != nil {
+		t.Fatalf("storage.Delete: %v", err)
+	}
+
+	rc, err := svc.OpenContent(context.Background(), created)
+	if err == nil {
+		rc.Close()
+		t.Fatal("OpenContent err = nil, want storage.ErrNotFound")
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("err = %v, want chain containing storage.ErrNotFound", err)
+	}
+	if rc != nil {
+		t.Errorf("reader = %v, want nil", rc)
+	}
+}
+
+func TestOpenContent_UnknownKind(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	bogus := &Share{ID: "bogusid1", Kind: "bogus"}
+	rc, err := svc.OpenContent(context.Background(), bogus)
+	if err == nil {
+		rc.Close()
+		t.Fatal("OpenContent err = nil, want non-nil for unknown kind")
+	}
+	if rc != nil {
+		t.Errorf("reader = %v, want nil", rc)
+	}
+}
