@@ -2,8 +2,10 @@
 // download flows depend on. It hides the difference between the filesystem
 // backend used in development (internal/storage/local) and the Cloudflare R2
 // backend used in production (internal/storage/r2) behind a single Storage
-// interface, and exposes a factory (internal/storage.New) that selects one
-// based on cfg.StorageBackend at startup.
+// interface. The factory that selects a concrete backend at startup lives in
+// a sibling package (internal/storage/factory) rather than here, because the
+// concrete backends must import this package for the interface — placing the
+// factory next to the interface would form an import cycle.
 //
 // Missing-object contract: both Get and Delete distinguish "the object does
 // not exist" from every other failure mode by returning an error that
