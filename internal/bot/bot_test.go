@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -447,6 +448,200 @@ func TestHandleText_ShareCreationError(t *testing.T) {
 	reply, err := tb.bot.handleText(context.Background(), newAdminMessage(tb, 42, "hello"))
 	if err != nil {
 		t.Fatalf("handleText: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+}
+
+// newDocumentMessage builds an admin-authored message carrying a Document
+// payload. Callers set doc fields (FileID, FileName, MimeType, FileSize) on
+// the returned Document to shape the specific test scenario.
+func newDocumentMessage(tb *testBot, chatID int64, doc *tgbotapi.Document) *tgbotapi.Message {
+	msg := newAdminMessage(tb, chatID, "")
+	msg.Document = doc
+	return msg
+}
+
+func TestHandleDocument_HappyPath(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_123"
+	tb.dl.body = []byte("hello world payload")
+
+	doc := &tgbotapi.Document{
+		FileID:   "doc_abc",
+		FileName: "report.txt",
+		MimeType: "text/plain",
+		FileSize: len(tb.dl.body),
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "report.txt") {
+		t.Errorf("reply.Text missing filename; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/") {
+		t.Errorf("reply.Text missing URL prefix; got %q", reply.Text)
+	}
+
+	if len(tb.api.getFileURLCalls) != 1 || tb.api.getFileURLCalls[0] != "doc_abc" {
+		t.Errorf("GetFileDirectURL calls = %v, want one call for %q",
+			tb.api.getFileURLCalls, "doc_abc")
+	}
+	if len(tb.dl.calls) != 1 || tb.dl.calls[0] != tb.api.fileURL {
+		t.Errorf("downloader calls = %v, want one call for %q", tb.dl.calls, tb.api.fileURL)
+	}
+
+	var (
+		shareID, kind, filename, mime string
+		size                          int64
+	)
+	err = tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT id, kind, original_filename, mime_type, size_bytes FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&shareID, &kind, &filename, &mime, &size)
+	if err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if kind != share.KindFile {
+		t.Errorf("stored kind = %q, want %q", kind, share.KindFile)
+	}
+	if filename != "report.txt" {
+		t.Errorf("stored filename = %q, want %q", filename, "report.txt")
+	}
+	if mime != "text/plain" {
+		t.Errorf("stored mime = %q, want %q", mime, "text/plain")
+	}
+	if size != int64(len(tb.dl.body)) {
+		t.Errorf("stored size = %d, want %d", size, len(tb.dl.body))
+	}
+
+	sh, err := tb.bot.share.Get(context.Background(), shareID)
+	if err != nil {
+		t.Fatalf("share.Get: %v", err)
+	}
+	rc, err := tb.bot.share.OpenContent(context.Background(), sh)
+	if err != nil {
+		t.Fatalf("OpenContent: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read storage object: %v", err)
+	}
+	if !bytes.Equal(got, tb.dl.body) {
+		t.Errorf("storage bytes = %q, want %q", got, tb.dl.body)
+	}
+}
+
+func TestHandleDocument_TooLarge(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.MaxUploadBytes = 100
+
+	doc := &tgbotapi.Document{
+		FileID:   "big_file",
+		FileName: "big.bin",
+		FileSize: 1000,
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "too large") {
+		t.Errorf("reply.Text missing too-large notice; got %q", reply.Text)
+	}
+
+	if len(tb.api.getFileURLCalls) != 0 {
+		t.Errorf("GetFileDirectURL called despite size guard: %v", tb.api.getFileURLCalls)
+	}
+	if len(tb.dl.calls) != 0 {
+		t.Errorf("downloader called despite size guard: %v", tb.dl.calls)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (oversized must not persist)", n)
+	}
+}
+
+func TestHandleDocument_DownloadError(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_err"
+	tb.dl.err = errors.New("simulated download failure")
+
+	doc := &tgbotapi.Document{
+		FileID:   "doc_err",
+		FileName: "report.txt",
+		FileSize: 1024,
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (failed download must not persist)", n)
+	}
+}
+
+func TestHandleDocument_ShareCreationError(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_ok"
+	tb.dl.body = []byte("test payload")
+
+	doc := &tgbotapi.Document{
+		FileID:   "doc_share_err",
+		FileName: "report.txt",
+		MimeType: "text/plain",
+		FileSize: len(tb.dl.body),
+	}
+
+	// force CreateFileShare to fail at allocateShareID by closing the DB
+	// handle before the call — mirrors TestHandleText_ShareCreationError.
+	if err := tb.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
 	}
 
 	if reply.ChatID != 42 {

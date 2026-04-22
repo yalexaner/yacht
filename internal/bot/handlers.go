@@ -76,6 +76,65 @@ func (b *Bot) handleText(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.M
 	return b.buildShareReply(msg.Chat.ID, share.KindText, "", 0, sh), nil
 }
 
+// handleDocument persists an attached file as a share and returns a success or
+// error reply. The size guard runs BEFORE any Telegram or HTTP I/O so
+// oversized uploads cost us a single cheap branch rather than a full download
+// we'd discard — bandwidth on a personal-VPS setup is the limiting factor, not
+// CPU.
+//
+// GetFileDirectURL resolves the bot-scoped download URL Telegram returns; the
+// injected downloader then streams the bytes. We pass the reader straight into
+// share.CreateFileShare without buffering so large files don't pin a full copy
+// in memory before the storage backend sees them. body.Close runs via defer
+// even on share-creation failure, which matters: CreateFileShare may fail
+// before consuming the reader (e.g. DB down during allocateShareID) and leaving
+// the HTTP connection unclosed would leak a socket on every failed upload.
+func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
+	doc := msg.Document
+	userID, ok := b.admins[msg.From.ID]
+	if !ok {
+		return tgbotapi.MessageConfig{}, nil
+	}
+
+	if int64(doc.FileSize) > b.cfg.MaxUploadBytes {
+		b.logger.InfoContext(ctx, "document rejected: too large",
+			"telegram_id", msg.From.ID,
+			"filename", doc.FileName,
+			"size", doc.FileSize,
+			"max", b.cfg.MaxUploadBytes,
+		)
+		body := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		return tgbotapi.NewMessage(msg.Chat.ID, body), nil
+	}
+
+	url, err := b.api.GetFileDirectURL(doc.FileID)
+	if err != nil {
+		b.logger.ErrorContext(ctx, "get file direct url", "err", err, "file_id", doc.FileID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	body, _, err := b.downloader.Download(ctx, url)
+	if err != nil {
+		b.logger.ErrorContext(ctx, "download document", "err", err, "file_id", doc.FileID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+	defer body.Close()
+
+	sh, err := b.share.CreateFileShare(ctx, share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: doc.FileName,
+		MIMEType:         doc.MimeType,
+		Size:             int64(doc.FileSize),
+		Content:          body,
+	})
+	if err != nil {
+		b.logger.ErrorContext(ctx, "create file share", "err", err, "telegram_id", msg.From.ID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	return b.buildShareReply(msg.Chat.ID, share.KindFile, doc.FileName, int64(doc.FileSize), sh), nil
+}
+
 // buildShareReply formats the ✓-prefixed success reply used by every
 // share-creating handler. Centralising the template here is the single
 // source of truth for URL formatting — cfg.BaseURL joined to the share ID
