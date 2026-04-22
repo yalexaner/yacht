@@ -57,6 +57,17 @@ func discardLogger() *slog.Logger {
 
 func TestRun_HappyPath(t *testing.T) {
 	env := validBotEnv()
+	// bot.New contacts Telegram via getMe during tgbotapi.NewBotAPI, so the
+	// sentinel token in validBotEnv ("...ABCDEFG...") would fail the call.
+	// Skip rather than fail so the default `go test` stays hermetic; operators
+	// who want to exercise the full startup can export a real
+	// TELEGRAM_BOT_TOKEN before running the suite, and the test will pick it
+	// up via YACHT_TEST_TELEGRAM_BOT_TOKEN.
+	realToken := os.Getenv("YACHT_TEST_TELEGRAM_BOT_TOKEN")
+	if realToken == "" {
+		t.Skip("set YACHT_TEST_TELEGRAM_BOT_TOKEN to exercise bot.New (hits Telegram getMe)")
+	}
+	env["TELEGRAM_BOT_TOKEN"] = realToken
 	// override DB_PATH and STORAGE_LOCAL_PATH to point at writable tempdirs
 	// so run() actually exercises db.New + db.Migrate against a real SQLite
 	// file and local.New's MkdirAll against a real directory. The production
@@ -68,7 +79,12 @@ func TestRun_HappyPath(t *testing.T) {
 	env["STORAGE_LOCAL_PATH"] = filepath.Join(tmp, "objects")
 	applyEnv(t, env)
 
-	if err := run(context.Background(), discardLogger()); err != nil {
+	// Run blocks on the long-poll loop, so drive it with a ctx that cancels
+	// almost immediately; we're only asserting that startup reached Run, not
+	// that Run processes updates here (bot package has its own Run tests).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := run(ctx, discardLogger()); err != nil {
 		t.Fatalf("run returned unexpected error: %v", err)
 	}
 
