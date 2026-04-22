@@ -811,6 +811,268 @@ func TestHandlePhoto_TooLarge(t *testing.T) {
 	}
 }
 
+// newCommandUpdate builds a /<cmd> update as Telegram would deliver it: the
+// message text is the full slash-prefixed command and a bot_command entity at
+// offset 0 spans the command token. Without the entity Message.IsCommand()
+// returns false and the dispatcher routes to the text handler instead, which
+// defeats the purpose of the command-dispatch tests.
+func newCommandUpdate(tb *testBot, chatID int64, cmd string) tgbotapi.Update {
+	text := "/" + cmd
+	return tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: chatID},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Text: text,
+			Entities: []tgbotapi.MessageEntity{
+				{Type: "bot_command", Offset: 0, Length: len(text)},
+			},
+		},
+	}
+}
+
+func TestHandleUpdate_NilMessage(t *testing.T) {
+	tb := newTestBot(t)
+
+	tb.bot.handleUpdate(context.Background(), tgbotapi.Update{})
+	tb.bot.handleUpdate(context.Background(), tgbotapi.Update{
+		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 1}, Text: "hello"},
+	})
+
+	if len(tb.api.sent) != 0 {
+		t.Errorf("api.Send called %d times, want 0 (nil-guard skipped)", len(tb.api.sent))
+	}
+}
+
+func TestHandleUpdate_Unauthorized(t *testing.T) {
+	tb := newTestBot(t)
+
+	var logBuf bytes.Buffer
+	tb.bot.logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat:     &tgbotapi.Chat{ID: 42},
+			From:     &tgbotapi.User{ID: tb.adminTG + 1, UserName: "intruder"},
+			Text:     "hello",
+		},
+	}
+
+	tb.bot.handleUpdate(context.Background(), update)
+
+	if len(tb.api.sent) != 0 {
+		t.Errorf("api.Send called for unauthorized user: %d sends", len(tb.api.sent))
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "unauthorized") {
+		t.Errorf("log missing unauthorized marker; got %q", logged)
+	}
+	if !strings.Contains(logged, "intruder") {
+		t.Errorf("log missing username; got %q", logged)
+	}
+}
+
+func TestHandleUpdate_DispatchesCommand(t *testing.T) {
+	tb := newTestBot(t)
+
+	tb.bot.handleUpdate(context.Background(), newCommandUpdate(tb, 42, "start"))
+
+	if len(tb.api.sent) != 1 {
+		t.Fatalf("api.Send called %d times, want 1", len(tb.api.sent))
+	}
+	sent, ok := tb.api.sent[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatalf("sent payload = %T, want tgbotapi.MessageConfig", tb.api.sent[0])
+	}
+	if sent.ChatID != 42 {
+		t.Errorf("sent.ChatID = %d, want 42", sent.ChatID)
+	}
+	if !strings.Contains(sent.Text, "Send me a file or text message") {
+		t.Errorf("sent.Text missing /start welcome body; got %q", sent.Text)
+	}
+}
+
+func TestHandleUpdate_UnknownCommandIgnored(t *testing.T) {
+	tb := newTestBot(t)
+
+	// /status is not one of the two MVP commands; dispatcher should drop it
+	// without replying. Lock this in so accidentally wiring an unknown-command
+	// fallback later doesn't silently leak replies to non-existent handlers.
+	tb.bot.handleUpdate(context.Background(), newCommandUpdate(tb, 42, "status"))
+
+	if len(tb.api.sent) != 0 {
+		t.Errorf("api.Send called for unknown command: %d sends", len(tb.api.sent))
+	}
+}
+
+func TestHandleUpdate_DispatchesDocument(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_disp"
+	tb.dl.body = []byte("dispatched-doc")
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 42},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Document: &tgbotapi.Document{
+				FileID:   "doc_disp",
+				FileName: "dispatched.txt",
+				MimeType: "text/plain",
+				FileSize: len(tb.dl.body),
+			},
+		},
+	}
+
+	tb.bot.handleUpdate(context.Background(), update)
+
+	if len(tb.api.sent) != 1 {
+		t.Fatalf("api.Send called %d times, want 1", len(tb.api.sent))
+	}
+	sent := tb.api.sent[0].(tgbotapi.MessageConfig)
+	if !strings.Contains(sent.Text, "dispatched.txt") {
+		t.Errorf("reply missing filename; got %q", sent.Text)
+	}
+
+	var kind string
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT kind FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&kind); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if kind != share.KindFile {
+		t.Errorf("stored kind = %q, want %q (document handler should have run)", kind, share.KindFile)
+	}
+}
+
+func TestHandleUpdate_DispatchesPhoto(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_disp"
+	tb.dl.body = []byte("dispatched-photo")
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 42},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Photo: []tgbotapi.PhotoSize{
+				{FileID: "photo_disp", FileUniqueID: "u_disp", FileSize: len(tb.dl.body)},
+			},
+		},
+	}
+
+	tb.bot.handleUpdate(context.Background(), update)
+
+	if len(tb.api.sent) != 1 {
+		t.Fatalf("api.Send called %d times, want 1", len(tb.api.sent))
+	}
+	sent := tb.api.sent[0].(tgbotapi.MessageConfig)
+	if !strings.Contains(sent.Text, "u_disp.jpg") {
+		t.Errorf("reply missing synthesised filename; got %q", sent.Text)
+	}
+
+	var filename string
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT original_filename FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&filename); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if filename != "u_disp.jpg" {
+		t.Errorf("stored filename = %q, want %q (photo handler should have run)", filename, "u_disp.jpg")
+	}
+}
+
+func TestHandleUpdate_DispatchesText(t *testing.T) {
+	tb := newTestBot(t)
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 42},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Text: "routed-text",
+		},
+	}
+
+	tb.bot.handleUpdate(context.Background(), update)
+
+	if len(tb.api.sent) != 1 {
+		t.Fatalf("api.Send called %d times, want 1", len(tb.api.sent))
+	}
+	sent := tb.api.sent[0].(tgbotapi.MessageConfig)
+	if !strings.Contains(sent.Text, "Saved as text") {
+		t.Errorf("reply missing text-saved marker; got %q", sent.Text)
+	}
+
+	var (
+		kind    string
+		content string
+	)
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT kind, text_content FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&kind, &content); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if kind != share.KindText {
+		t.Errorf("stored kind = %q, want %q", kind, share.KindText)
+	}
+	if content != "routed-text" {
+		t.Errorf("stored text_content = %q, want %q", content, "routed-text")
+	}
+}
+
+func TestHandleUpdate_PriorityOrder(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_priority"
+	tb.dl.body = []byte("file-wins")
+
+	// Document + caption in the same message: file wins, caption is ignored.
+	// Caption-as-password is explicitly deferred per SPEC § Open Questions,
+	// so the text must not leak into a separate text share.
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 42},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Text: "ignored caption",
+			Document: &tgbotapi.Document{
+				FileID:   "doc_priority",
+				FileName: "priority.bin",
+				MimeType: "application/octet-stream",
+				FileSize: len(tb.dl.body),
+			},
+		},
+	}
+
+	tb.bot.handleUpdate(context.Background(), update)
+
+	var (
+		n    int
+		kind string
+	)
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("shares row count = %d, want 1 (only document share should persist)", n)
+	}
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT kind FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&kind); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if kind != share.KindFile {
+		t.Errorf("stored kind = %q, want %q (document should win over caption)", kind, share.KindFile)
+	}
+}
+
 func TestHandleText_UnauthorizedSender(t *testing.T) {
 	tb := newTestBot(t)
 

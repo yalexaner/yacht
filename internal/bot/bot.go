@@ -72,6 +72,82 @@ func New(
 	return nil, errors.New("bot.New: not yet wired")
 }
 
+// handleUpdate is the per-update dispatcher: filter noise, enforce auth, route
+// to the right handler, forward the reply. It intentionally never returns an
+// error — any failure here (handler error, Send failure) is logged and
+// swallowed because the Run loop cannot distinguish "one user sent garbage"
+// from "everything is broken"; letting one bad update kill the long-poll loop
+// would take the whole bot offline for a single recoverable glitch.
+//
+// Auth happens before dispatch so an unauthorized sender can't trigger any
+// handler path (including the pure /start and /help replies — Phase 12 will
+// add a polite "access pending" reply for non-admins, but for Phase 6 we
+// silently drop to keep the attack surface minimal).
+//
+// Dispatch priority is command → document → photo → text. Document wins over
+// text when a caption is present because the file is the content the sender
+// wants to share; the caption-as-password use is explicitly deferred per
+// SPEC § Open Questions, so the caption is ignored in MVP.
+func (b *Bot) handleUpdate(ctx context.Context, update tgbotapi.Update) {
+	if update.Message == nil || update.Message.From == nil {
+		return
+	}
+	msg := update.Message
+
+	if _, ok := b.admins[msg.From.ID]; !ok {
+		b.logger.WarnContext(ctx, "unauthorized telegram user",
+			"telegram_id", msg.From.ID,
+			"username", msg.From.UserName,
+		)
+		return
+	}
+
+	var (
+		reply tgbotapi.MessageConfig
+		err   error
+	)
+	switch {
+	case msg.IsCommand():
+		switch msg.Command() {
+		case "start":
+			reply, err = b.handleStart(ctx, msg)
+		case "help":
+			reply, err = b.handleHelp(ctx, msg)
+		default:
+			return
+		}
+	case msg.Document != nil:
+		reply, err = b.handleDocument(ctx, msg)
+	case len(msg.Photo) > 0:
+		reply, err = b.handlePhoto(ctx, msg)
+	case msg.Text != "":
+		reply, err = b.handleText(ctx, msg)
+	default:
+		return
+	}
+
+	if err != nil {
+		b.logger.ErrorContext(ctx, "handler error",
+			"err", err,
+			"telegram_id", msg.From.ID,
+		)
+	}
+
+	// handlers return a zero-value MessageConfig to signal "no reply" (empty
+	// text, unauthorized sneak-through); ChatID stays 0 in that case because
+	// every production reply path goes through tgbotapi.NewMessage which sets
+	// it. Guarding on ChatID keeps us from shipping silent empty sends.
+	if reply.ChatID == 0 {
+		return
+	}
+	if _, err := b.api.Send(reply); err != nil {
+		b.logger.ErrorContext(ctx, "send reply",
+			"err", err,
+			"telegram_id", msg.From.ID,
+		)
+	}
+}
+
 // bootstrapUsers upserts every admin Telegram ID in adminIDs into the users
 // table and returns a map of telegramID → users.id. It bridges config-driven
 // admin IDs to the FK-required shares.user_id so handlers can persist shares
