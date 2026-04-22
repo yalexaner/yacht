@@ -109,14 +109,14 @@
 
 ## Phase 5: Core share logic
 
-- [ ] `internal/share/service.go` — `Service` struct (db, storage, config deps)
-- [ ] `Service.CreateFileShare(ctx, opts)` — generate nanoid, upload, insert row
-- [ ] `Service.CreateTextShare(ctx, opts)` — generate nanoid, insert row only
-- [ ] `Service.Get(ctx, id)` — fetch metadata, return typed error if expired/missing
-- [ ] `Service.OpenContent(ctx, share)` — returns reader (calls storage)
-- [ ] `Service.VerifyPassword(share, password)` — bcrypt compare
-- [ ] `Service.IncrementDownloadCount(ctx, id)`
-- [ ] Unit tests with local storage + temp SQLite
+- [x] `internal/share/service.go` — `Service` struct (db, storage, config deps)
+- [x] `Service.CreateFileShare(ctx, opts)` — generate nanoid, upload, insert row
+- [x] `Service.CreateTextShare(ctx, opts)` — generate nanoid, insert row only
+- [x] `Service.Get(ctx, id)` — fetch metadata, return typed error if expired/missing
+- [x] `Service.OpenContent(ctx, share)` — returns reader (calls storage)
+- [x] `Service.VerifyPassword(share, password)` — bcrypt compare
+- [x] `Service.IncrementDownloadCount(ctx, id)`
+- [x] Unit tests with local storage + temp SQLite
 
 ---
 
