@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 
@@ -69,4 +70,40 @@ func New(
 	logger *slog.Logger,
 ) (*Bot, error) {
 	return nil, errors.New("bot.New: not yet wired")
+}
+
+// bootstrapUsers upserts every admin Telegram ID in adminIDs into the users
+// table and returns a map of telegramID → users.id. It bridges config-driven
+// admin IDs to the FK-required shares.user_id so handlers can persist shares
+// without a per-message lookup.
+//
+// The upsert also promotes any pre-existing non-admin row to is_admin=1,
+// matching the "operator-overrides-allowlist on every restart" semantics —
+// admin status in Phase 6 is config-driven, so what the config says wins
+// every startup. Phase 12 will reuse this same upsert for runtime /allow
+// invocations.
+//
+// An empty adminIDs slice is rejected defensively: config.LoadBot already
+// enforces TELEGRAM_ADMIN_IDS being non-empty, but the bot package cannot
+// issue shares without at least one admin, so we fail loud rather than
+// construct a bot that silently rejects every message.
+func bootstrapUsers(ctx context.Context, db *sql.DB, adminIDs []int64) (map[int64]int64, error) {
+	if len(adminIDs) == 0 {
+		return nil, errors.New("bootstrapUsers: adminIDs is empty")
+	}
+
+	const upsertSQL = `INSERT INTO users (telegram_id, is_admin, created_at)
+VALUES (?, 1, strftime('%s','now'))
+ON CONFLICT(telegram_id) DO UPDATE SET is_admin = 1
+RETURNING id`
+
+	admins := make(map[int64]int64, len(adminIDs))
+	for _, tgID := range adminIDs {
+		var rowID int64
+		if err := db.QueryRowContext(ctx, upsertSQL, tgID).Scan(&rowID); err != nil {
+			return nil, fmt.Errorf("bootstrapUsers: upsert telegram_id=%d: %w", tgID, err)
+		}
+		admins[tgID] = rowID
+	}
+	return admins, nil
 }
