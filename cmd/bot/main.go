@@ -1,7 +1,7 @@
 // Package main is the entrypoint for the yacht bot binary. Phase 2 loads
 // configuration and logs a safe view of it; Phase 3 adds the SQLite open +
-// migration step on startup; the Telegram polling/webhook loop lands in a
-// later phase.
+// migration step on startup; Phase 4 adds the storage backend construction
+// step; the Telegram polling/webhook loop lands in a later phase.
 package main
 
 import (
@@ -12,16 +12,20 @@ import (
 
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
+	"github.com/yalexaner/yacht/internal/storage/factory"
 )
 
 // run loads the bot configuration, opens the SQLite database, applies any
-// pending schema migrations, and returns. It is split out from main so tests
-// can drive it with a discard logger and t.Setenv without touching os.Exit.
+// pending schema migrations, constructs the storage backend, and returns. It
+// is split out from main so tests can drive it with a discard logger and
+// t.Setenv without touching os.Exit.
 //
-// Order matters: config first (so we know which DB path to open), then the
-// DB open + ping (so permission / path errors surface here rather than on
-// the first Telegram update), then migrations (so by the time the bot loop
-// lands in a later phase every table it needs already exists).
+// Order matters: config first (so we know which DB path and storage backend
+// to use), then the DB open + ping (so permission / path errors surface here
+// rather than on the first Telegram update), then migrations (so by the time
+// the bot loop lands in a later phase every table it needs already exists),
+// then storage (so credential / filesystem misconfiguration surfaces at boot
+// rather than on the first upload).
 func run(ctx context.Context, logger *slog.Logger) error {
 	cfg, err := config.LoadBot()
 	if err != nil {
@@ -50,6 +54,18 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		"path", cfg.DBPath,
 		"pending_migrations_applied", applied,
 	)
+
+	store, err := factory.New(ctx, cfg.Shared)
+	if err != nil {
+		return fmt.Errorf("init storage: %w", err)
+	}
+	// no `defer store.Close()`: the storage.Storage interface has no Close
+	// method because neither backend holds a resource that needs one — the
+	// local backend is stateless, and the S3 client pools connections
+	// internally. Do not "fix" this by adding a Close.
+	_ = store // will be threaded into handlers in Phase 6.
+
+	factory.LogReady(logger, cfg.Shared)
 
 	return nil
 }

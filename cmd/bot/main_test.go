@@ -15,24 +15,22 @@ import (
 // validBotEnv mirrors the env map used in internal/config tests but lives
 // here as a small local helper so cmd/bot tests stay self-contained.
 //
-// DB_PATH is deliberately omitted: tests that drive run() must set it to a
-// t.TempDir()-based path so the real sqlite.Open + Migrate codepaths land
-// against a writable file. Tests that exercise only config validation will
-// surface DB_PATH in the aggregated LoadBot error if unset — which is the
-// intended fail-loud behaviour for forgotten overrides.
+// DB_PATH and STORAGE_LOCAL_PATH default to sentinel production paths;
+// individual tests that actually drive run() should override them with
+// t.TempDir()-based paths so the real sqlite.Open + Migrate and
+// local.New codepaths land against writable files. STORAGE_BACKEND defaults
+// to "local" so the storage step uses the hermetic filesystem backend rather
+// than attempting to reach Cloudflare R2 from the test runner.
 func validBotEnv() map[string]string {
 	return map[string]string{
 		"BASE_URL":             "https://send.example.com",
 		"BRAND_URL":            "https://brand.example.com",
+		"DB_PATH":              "/var/lib/yacht/meta.db",
 		"DEFAULT_LANG":         "en",
 		"DEFAULT_EXPIRY_HOURS": "24",
 		"MAX_UPLOAD_BYTES":     "104857600",
-		"STORAGE_BACKEND":      "r2",
-		"R2_ACCOUNT_ID":        "acct-123",
-		"R2_ACCESS_KEY_ID":     "AKIDEXAMPLE1234567890",
-		"R2_SECRET_ACCESS_KEY": "secret-ABCDEFGHIJKLMNOP",
-		"R2_BUCKET":            "yacht-shares",
-		"R2_ENDPOINT":          "https://acct.r2.cloudflarestorage.com",
+		"STORAGE_BACKEND":      "local",
+		"STORAGE_LOCAL_PATH":   "/var/lib/yacht/files",
 		"TELEGRAM_BOT_TOKEN":   "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ",
 		"TELEGRAM_ADMIN_IDS":   "123456789,987654321",
 		"WEBHOOK_URL":          "https://send.example.com/bot/webhook",
@@ -59,11 +57,15 @@ func discardLogger() *slog.Logger {
 
 func TestRun_HappyPath(t *testing.T) {
 	env := validBotEnv()
-	// set DB_PATH to a writable tempdir so run() actually exercises
-	// db.New + db.Migrate against a real SQLite file. validBotEnv leaves
-	// DB_PATH unset so a forgotten override fails loudly in LoadBot.
-	dbPath := filepath.Join(t.TempDir(), "meta.db")
+	// override DB_PATH and STORAGE_LOCAL_PATH to point at writable tempdirs
+	// so run() actually exercises db.New + db.Migrate against a real SQLite
+	// file and local.New's MkdirAll against a real directory. The production
+	// sentinel paths in validBotEnv would hit permission errors under
+	// `go test`.
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "meta.db")
 	env["DB_PATH"] = dbPath
+	env["STORAGE_LOCAL_PATH"] = filepath.Join(tmp, "objects")
 	applyEnv(t, env)
 
 	if err := run(context.Background(), discardLogger()); err != nil {
@@ -77,6 +79,12 @@ func TestRun_HappyPath(t *testing.T) {
 		t.Errorf("expected db file at %q after run, got stat err: %v", dbPath, err)
 	}
 	assertMigrated(t, dbPath)
+	// local.New MkdirAll's the storage root, so the happy path must have
+	// created it. If it's missing, run() returned success without actually
+	// invoking the storage factory — a silent regression we want to catch.
+	if _, err := os.Stat(filepath.Join(tmp, "objects")); err != nil {
+		t.Errorf("expected storage root after run, got stat err: %v", err)
+	}
 }
 
 // assertMigrated reopens the DB at dbPath and fails the test if
@@ -108,7 +116,7 @@ func TestRun_MissingRequiredVar(t *testing.T) {
 	env := validBotEnv()
 	// blank a required bot var so LoadBot aggregates an error. Using empty
 	// string rather than delete() because t.Setenv only sets values and some
-	// parent processes may already have TELEGRAM_BOT_TOKEN exported.
+	// parent processes may already have BASE_URL exported.
 	env["TELEGRAM_BOT_TOKEN"] = ""
 	applyEnv(t, env)
 
@@ -118,6 +126,38 @@ func TestRun_MissingRequiredVar(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TELEGRAM_BOT_TOKEN") {
 		t.Errorf("err should mention TELEGRAM_BOT_TOKEN, got %q", err.Error())
+	}
+}
+
+// TestRun_StorageInitFails drives the storage-factory failure path through
+// run's wrapping logic: pointing STORAGE_LOCAL_PATH at a location whose
+// parent is a regular file (not a directory) causes local.New's MkdirAll to
+// fail. The returned error must be wrapped with the "init storage" prefix so
+// operators can tell at a glance which startup step failed.
+func TestRun_StorageInitFails(t *testing.T) {
+	env := validBotEnv()
+	tmp := t.TempDir()
+	// DB_PATH must be valid so the test actually reaches the storage step
+	// rather than failing earlier. Same approach as TestRun_HappyPath.
+	env["DB_PATH"] = filepath.Join(tmp, "meta.db")
+	// create a regular file and point STORAGE_LOCAL_PATH underneath it; the
+	// kernel refuses to create a directory whose parent is a non-directory,
+	// so MkdirAll returns an error. Same barrier-file trick as the DB test.
+	barrier := filepath.Join(tmp, "not-a-dir")
+	if err := os.WriteFile(barrier, []byte("x"), 0o600); err != nil {
+		t.Fatalf("create barrier file: %v", err)
+	}
+	env["STORAGE_LOCAL_PATH"] = filepath.Join(barrier, "objects")
+	applyEnv(t, env)
+
+	err := run(context.Background(), discardLogger())
+	if err == nil {
+		t.Fatal("want error for unwritable STORAGE_LOCAL_PATH, got nil")
+	}
+	// lock in the "init storage:" prefix specifically so a regression that
+	// swaps wraps (or mentions "storage" only indirectly) fails this test.
+	if !strings.Contains(err.Error(), "init storage") {
+		t.Errorf("err should mention \"init storage\", got %q", err.Error())
 	}
 }
 
