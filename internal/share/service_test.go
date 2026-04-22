@@ -300,6 +300,10 @@ func TestCreateFileShare_ValidatesInput(t *testing.T) {
 			name:   "empty filename",
 			mutate: func(o *CreateFileOpts) { o.OriginalFilename = "" },
 		},
+		{
+			name:   "negative expiry",
+			mutate: func(o *CreateFileOpts) { o.Expiry = -1 * time.Hour },
+		},
 	}
 
 	for _, tc := range cases {
@@ -448,6 +452,10 @@ func TestCreateTextShare_ValidatesInput(t *testing.T) {
 			name:   "zero user id",
 			mutate: func(o *CreateTextOpts) { o.UserID = 0 },
 		},
+		{
+			name:   "negative expiry",
+			mutate: func(o *CreateTextOpts) { o.Expiry = -1 * time.Hour },
+		},
 	}
 
 	for _, tc := range cases {
@@ -462,6 +470,90 @@ func TestCreateTextShare_ValidatesInput(t *testing.T) {
 				t.Errorf("CreateTextShare(%s) share = %+v, want nil", tc.name, got)
 			}
 		})
+	}
+}
+
+// recordingStorage delegates to a real local backend but records every key
+// passed to Delete, so a test can assert that CreateFileShare's failure-path
+// cleanup actually fires.
+type recordingStorage struct {
+	inner   storage.Storage
+	deleted []string
+}
+
+func (r *recordingStorage) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	return r.inner.Put(ctx, key, body, size, contentType)
+}
+
+func (r *recordingStorage) Get(ctx context.Context, key string) (io.ReadCloser, *storage.ObjectInfo, error) {
+	return r.inner.Get(ctx, key)
+}
+
+func (r *recordingStorage) Delete(ctx context.Context, key string) error {
+	r.deleted = append(r.deleted, key)
+	return r.inner.Delete(ctx, key)
+}
+
+// TestCreateFileShare_InsertFailureDeletesUploadedObject locks in the
+// best-effort-cleanup contract: if the upload succeeds but the INSERT fails,
+// CreateFileShare must call storage.Delete on the just-uploaded key so the
+// failed creation doesn't leak an orphan that no DB-walking cleanup pass can
+// later discover.
+//
+// We force the INSERT to fail by enabling SQLite foreign-key enforcement and
+// passing a UserID that does not exist in users — the FK constraint on
+// shares.user_id then rejects the row, which is the closest faithful proxy
+// for a real "row-rejected after upload-succeeded" failure.
+func TestCreateFileShare_InsertFailureDeletesUploadedObject(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "meta.db")
+	handle, err := db.New(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	t.Cleanup(func() { handle.Close() })
+	if _, err := db.Migrate(ctx, handle); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+	if _, err := handle.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatalf("enable fks: %v", err)
+	}
+
+	innerBackend, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	rec := &recordingStorage{inner: innerBackend}
+
+	cfg := &config.Shared{DefaultExpiry: 24 * time.Hour}
+	svc := New(handle, rec, cfg)
+
+	got, err := svc.CreateFileShare(ctx, CreateFileOpts{
+		UserID:           99999, // no such user → FK rejection
+		OriginalFilename: "x.txt",
+		MIMEType:         "text/plain",
+		Size:             1,
+		Content:          bytes.NewReader([]byte("x")),
+	})
+	if err == nil {
+		t.Fatal("CreateFileShare err = nil, want FK-driven insert failure")
+	}
+	if got != nil {
+		t.Errorf("share = %+v, want nil", got)
+	}
+	if len(rec.deleted) != 1 {
+		t.Fatalf("storage.Delete calls = %d, want 1 (best-effort orphan cleanup)", len(rec.deleted))
+	}
+
+	// the deleted key must be the one that was just uploaded — i.e. it must
+	// no longer be retrievable from storage. Otherwise the cleanup hit the
+	// wrong key (or didn't run on the uploaded one).
+	rc, _, getErr := innerBackend.Get(ctx, rec.deleted[0])
+	if getErr == nil {
+		rc.Close()
+		t.Errorf("storage.Get(%q) succeeded after failure-path Delete; want ErrNotFound", rec.deleted[0])
+	} else if !errors.Is(getErr, storage.ErrNotFound) {
+		t.Errorf("storage.Get(%q) err = %v, want ErrNotFound", rec.deleted[0], getErr)
 	}
 }
 

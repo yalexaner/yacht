@@ -9,13 +9,15 @@
 // Phase 6/7) — this package exposes only the logic surface. No handlers, no
 // HTTP, no Telegram.
 //
-// Sentinel errors: Get, OpenContent, VerifyPassword, and IncrementDownloadCount
-// return one of the exported sentinels below when the caller can act on the
-// specific condition (share missing, expired, password mismatch, share has
-// no password set). Every return site wraps the sentinel with fmt.Errorf
-// "...: %w" so callers MUST use errors.Is — never equality, never a type
-// assertion — to match. This lets the wrapping shape evolve without breaking
-// consumers.
+// Sentinel errors: Get, VerifyPassword, and IncrementDownloadCount return
+// one of the exported sentinels below when the caller can act on the specific
+// condition (share missing, expired, password mismatch, share has no password
+// set). OpenContent does NOT translate storage-layer failures into share
+// sentinels; it forwards storage.ErrNotFound unchanged so operators can
+// distinguish db/storage drift from "share never existed". Every sentinel
+// return site wraps with fmt.Errorf "...: %w" so callers MUST use errors.Is —
+// never equality, never a type assertion — to match. This lets the wrapping
+// shape evolve without breaking consumers.
 package share
 
 import (
@@ -148,6 +150,36 @@ func newShareID() (string, error) {
 	return id, nil
 }
 
+// allocateShareID returns a fresh ID that does not yet exist in the shares
+// table. With ~47 bits of entropy from an 8-char nanoid the loop body almost
+// never runs more than once at personal scale, but a pre-upload existence
+// check is cheap insurance against the cross-share corruption that would
+// otherwise follow from the upload-then-insert design: a colliding ID would
+// see s.storage.Put overwrite the existing share's bytes before the INSERT
+// failed on PRIMARY KEY, leaving the original share permanently pointing at
+// the wrong payload. The check races with concurrent CreateShare calls
+// (TOCTOU between this SELECT and the eventual INSERT), but at personal scale
+// a sub-microsecond collision window between two concurrent creations is not
+// a realistic failure mode. The retry cap exists only as defense against an
+// otherwise infinite loop if the table somehow filled the keyspace.
+func (s *Service) allocateShareID(ctx context.Context) (string, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		id, err := newShareID()
+		if err != nil {
+			return "", err
+		}
+		var seen int
+		err = s.db.QueryRowContext(ctx, `SELECT 1 FROM shares WHERE id = ?`, id).Scan(&seen)
+		if errors.Is(err, sql.ErrNoRows) {
+			return id, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("check share id collision: %w", err)
+		}
+	}
+	return "", errors.New("allocate share id: 5 collisions in a row")
+}
+
 // hashPassword returns a bcrypt hash of plaintext wrapped in a pointer, or
 // (nil, nil) when plaintext is empty (the share has no password). bcrypt's
 // DefaultCost=10 is the library's recommended default — fast enough on a
@@ -171,12 +203,23 @@ func hashPassword(plaintext string) (*string, error) {
 // same value used as the storage key (flat, no prefix — see SPEC).
 //
 // Upload-then-insert order: the object is written to storage BEFORE the
-// database row is inserted. If the insert fails, the object is orphaned in
-// storage; Phase 8's cleanup worker garbage-collects it by walking expired
-// shares. The alternative (insert-then-upload) would produce DB rows
-// without backing bytes, which surfaces on Get → OpenContent as
-// storage.ErrNotFound — indistinguishable from actual data loss. Tolerating
-// orphans is the better failure mode.
+// database row is inserted. The alternative (insert-then-upload) would
+// produce DB rows without backing bytes, which surfaces on Get →
+// OpenContent as storage.ErrNotFound — indistinguishable from actual data
+// loss to the user. Tolerating storage orphans on insert failure is the
+// better failure mode, and we minimize the orphan window two ways:
+//
+//   - allocateShareID does a pre-upload SELECT so a colliding ID can't make
+//     storage.Put silently overwrite an existing share's bytes (which would
+//     be cross-share corruption — far worse than an orphan).
+//   - on insert failure we do a best-effort storage.Delete to drop the just-
+//     uploaded object. This is safe because the pre-check guarantees we're
+//     the only writer of this key in the no-concurrent-collision case.
+//
+// Anything still leaking past those two lines (process crash between Put
+// and INSERT, Delete failure on a real disk error) falls through to the R2
+// 60-day lifecycle rule documented in SPEC § Background Workers as the
+// final safety net.
 func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Share, error) {
 	if opts.Content == nil {
 		return nil, fmt.Errorf("create file share: content reader is nil")
@@ -190,6 +233,9 @@ func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Sh
 	if opts.OriginalFilename == "" {
 		return nil, fmt.Errorf("create file share: original filename is empty")
 	}
+	if opts.Expiry < 0 {
+		return nil, fmt.Errorf("create file share: negative expiry %v", opts.Expiry)
+	}
 
 	// zero Expiry means "use cfg default"; a non-zero Expiry lets callers
 	// override per-share without mutating shared config.
@@ -198,7 +244,7 @@ func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Sh
 		expiry = s.cfg.DefaultExpiry
 	}
 
-	id, err := newShareID()
+	id, err := s.allocateShareID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("create file share: %w", err)
 	}
@@ -223,6 +269,13 @@ func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Sh
 	`, id, opts.UserID, opts.OriginalFilename, opts.MIMEType, opts.Size,
 		id, passwordHash, now.Unix(), expiresAt.Unix())
 	if err != nil {
+		// best-effort cleanup of the just-uploaded object so a transient DB
+		// failure doesn't leak storage. Safe because allocateShareID's pre-
+		// check guarantees we own this key (in the no-concurrent-collision
+		// case, which is effectively all cases at personal scale). Swallow
+		// any Delete error: the orphan that remains is what the R2 60-day
+		// lifecycle is configured to catch.
+		_ = s.storage.Delete(ctx, id)
 		return nil, fmt.Errorf("create file share: insert: %w", err)
 	}
 
@@ -263,6 +316,9 @@ func (s *Service) CreateTextShare(ctx context.Context, opts CreateTextOpts) (*Sh
 	if opts.Content == "" {
 		return nil, fmt.Errorf("create text share: content is empty")
 	}
+	if opts.Expiry < 0 {
+		return nil, fmt.Errorf("create text share: negative expiry %v", opts.Expiry)
+	}
 
 	// zero Expiry means "use cfg default"; a non-zero Expiry lets callers
 	// override per-share without mutating shared config.
@@ -271,7 +327,7 @@ func (s *Service) CreateTextShare(ctx context.Context, opts CreateTextOpts) (*Sh
 		expiry = s.cfg.DefaultExpiry
 	}
 
-	id, err := newShareID()
+	id, err := s.allocateShareID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("create text share: %w", err)
 	}
@@ -314,11 +370,14 @@ func (s *Service) CreateTextShare(ctx context.Context, opts CreateTextOpts) (*Sh
 //     share's content)
 //   - the row exists and is live → (*Share, nil)
 //
-// The expiry comparison uses strict "<" (via time.Time.Before): a share
-// whose expires_at exactly equals the current second is still considered
-// live. Since expires_at is stored at second resolution, this gives callers
-// a full sub-second grace window on the boundary rather than tripping
-// ErrExpired the instant the clock ticks over.
+// The expiry comparison is strict "<" via time.Time.Before at nanosecond
+// precision. expires_at is stored at second resolution (nanos=0 on read),
+// while time.Now() carries sub-second nanos, so a share becomes expired the
+// first nanosecond of the Unix second stored in expires_at — not at the end
+// of it. Example: expires_at=1_700_000_000 flips to ErrExpired as soon as
+// time.Now() reaches 1_700_000_000.000000001. This is the intended semantic:
+// callers see the share stay live through every second strictly before the
+// boundary, then transition cleanly at the boundary itself.
 //
 // Cleanup of expired rows is async (see Phase 8), so expired rows linger in
 // the table — surfacing them as ErrExpired rather than ErrNotFound lets
