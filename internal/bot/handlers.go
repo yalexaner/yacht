@@ -135,6 +135,69 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 	return b.buildShareReply(msg.Chat.ID, share.KindFile, doc.FileName, int64(doc.FileSize), sh), nil
 }
 
+// handlePhoto persists an attached photo as a share and returns a success or
+// error reply. Shape mirrors handleDocument with two photo-specific twists.
+//
+// Telegram sends multiple PhotoSize entries per message — one per thumbnail the
+// server pre-generated — ordered smallest-first. We pick the last entry (the
+// original, highest-resolution version) because that's the file the sender
+// actually shared; any smaller size would silently downgrade their upload.
+//
+// Telegram also strips the original filename from photos sent via the gallery
+// picker (it survives only when the sender uses "send as file", which routes
+// through handleDocument). We synthesise one from FileUniqueID + ".jpg" — the
+// unique ID is stable per file so re-sends of the same photo stay recognisable
+// in the shares table — and hardcode image/jpeg since Telegram re-encodes every
+// gallery-path photo to JPEG regardless of the source format.
+func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
+	photos := msg.Photo
+	userID, ok := b.admins[msg.From.ID]
+	if !ok {
+		return tgbotapi.MessageConfig{}, nil
+	}
+
+	largest := photos[len(photos)-1]
+
+	if int64(largest.FileSize) > b.cfg.MaxUploadBytes {
+		b.logger.InfoContext(ctx, "photo rejected: too large",
+			"telegram_id", msg.From.ID,
+			"file_unique_id", largest.FileUniqueID,
+			"size", largest.FileSize,
+			"max", b.cfg.MaxUploadBytes,
+		)
+		body := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		return tgbotapi.NewMessage(msg.Chat.ID, body), nil
+	}
+
+	url, err := b.api.GetFileDirectURL(largest.FileID)
+	if err != nil {
+		b.logger.ErrorContext(ctx, "get file direct url", "err", err, "file_id", largest.FileID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	body, _, err := b.downloader.Download(ctx, url)
+	if err != nil {
+		b.logger.ErrorContext(ctx, "download photo", "err", err, "file_id", largest.FileID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+	defer body.Close()
+
+	filename := largest.FileUniqueID + ".jpg"
+	sh, err := b.share.CreateFileShare(ctx, share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: filename,
+		MIMEType:         "image/jpeg",
+		Size:             int64(largest.FileSize),
+		Content:          body,
+	})
+	if err != nil {
+		b.logger.ErrorContext(ctx, "create file share", "err", err, "telegram_id", msg.From.ID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	return b.buildShareReply(msg.Chat.ID, share.KindFile, filename, int64(largest.FileSize), sh), nil
+}
+
 // buildShareReply formats the ✓-prefixed success reply used by every
 // share-creating handler. Centralising the template here is the single
 // source of truth for URL formatting — cfg.BaseURL joined to the share ID

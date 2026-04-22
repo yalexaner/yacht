@@ -652,6 +652,165 @@ func TestHandleDocument_ShareCreationError(t *testing.T) {
 	}
 }
 
+// newPhotoMessage builds an admin-authored message carrying a Photo payload.
+// Callers pass the PhotoSize slice to shape the specific test scenario (single
+// size for happy path, multiple sizes for the largest-picker test).
+func newPhotoMessage(tb *testBot, chatID int64, photos []tgbotapi.PhotoSize) *tgbotapi.Message {
+	msg := newAdminMessage(tb, chatID, "")
+	msg.Photo = photos
+	return msg
+}
+
+func TestHandlePhoto_HappyPath(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_321"
+	tb.dl.body = []byte("pretend-jpeg-bytes")
+
+	photos := []tgbotapi.PhotoSize{
+		{
+			FileID:       "photo_abc",
+			FileUniqueID: "unique_xyz",
+			Width:        1024,
+			Height:       768,
+			FileSize:     len(tb.dl.body),
+		},
+	}
+
+	reply, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "unique_xyz.jpg") {
+		t.Errorf("reply.Text missing synthesised filename; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/") {
+		t.Errorf("reply.Text missing URL prefix; got %q", reply.Text)
+	}
+
+	var (
+		shareID, kind, filename, mime string
+		size                          int64
+	)
+	err = tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT id, kind, original_filename, mime_type, size_bytes FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&shareID, &kind, &filename, &mime, &size)
+	if err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if kind != share.KindFile {
+		t.Errorf("stored kind = %q, want %q", kind, share.KindFile)
+	}
+	if filename != "unique_xyz.jpg" {
+		t.Errorf("stored filename = %q, want %q", filename, "unique_xyz.jpg")
+	}
+	if mime != "image/jpeg" {
+		t.Errorf("stored mime = %q, want %q", mime, "image/jpeg")
+	}
+	if size != int64(len(tb.dl.body)) {
+		t.Errorf("stored size = %d, want %d", size, len(tb.dl.body))
+	}
+
+	sh, err := tb.bot.share.Get(context.Background(), shareID)
+	if err != nil {
+		t.Fatalf("share.Get: %v", err)
+	}
+	rc, err := tb.bot.share.OpenContent(context.Background(), sh)
+	if err != nil {
+		t.Fatalf("OpenContent: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read storage object: %v", err)
+	}
+	if !bytes.Equal(got, tb.dl.body) {
+		t.Errorf("storage bytes = %q, want %q", got, tb.dl.body)
+	}
+}
+
+func TestHandlePhoto_PicksLargest(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_largest"
+	tb.dl.body = []byte("largest-bytes")
+
+	// Telegram orders PhotoSize entries smallest-first. The handler must pick
+	// the last one — any other choice silently downgrades the sender's upload.
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_small", FileUniqueID: "u_small", Width: 90, Height: 60, FileSize: 500},
+		{FileID: "photo_medium", FileUniqueID: "u_medium", Width: 320, Height: 240, FileSize: 5000},
+		{FileID: "photo_large", FileUniqueID: "u_large", Width: 1280, Height: 960, FileSize: len(tb.dl.body)},
+	}
+
+	if _, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos)); err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if len(tb.api.getFileURLCalls) != 1 || tb.api.getFileURLCalls[0] != "photo_large" {
+		t.Errorf("GetFileDirectURL calls = %v, want one call for %q",
+			tb.api.getFileURLCalls, "photo_large")
+	}
+
+	var filename string
+	err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT original_filename FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&filename)
+	if err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if filename != "u_large.jpg" {
+		t.Errorf("stored filename = %q, want %q (largest PhotoSize's FileUniqueID)",
+			filename, "u_large.jpg")
+	}
+}
+
+func TestHandlePhoto_TooLarge(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.MaxUploadBytes = 100
+
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_small", FileUniqueID: "u_small", FileSize: 50},
+		{FileID: "photo_large", FileUniqueID: "u_large", FileSize: 1000},
+	}
+
+	reply, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "too large") {
+		t.Errorf("reply.Text missing too-large notice; got %q", reply.Text)
+	}
+
+	if len(tb.api.getFileURLCalls) != 0 {
+		t.Errorf("GetFileDirectURL called despite size guard: %v", tb.api.getFileURLCalls)
+	}
+	if len(tb.dl.calls) != 0 {
+		t.Errorf("downloader called despite size guard: %v", tb.dl.calls)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (oversized must not persist)", n)
+	}
+}
+
 func TestHandleText_UnauthorizedSender(t *testing.T) {
 	tb := newTestBot(t)
 
