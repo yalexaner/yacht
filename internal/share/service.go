@@ -404,6 +404,32 @@ func (s *Service) OpenContent(ctx context.Context, sh *Share) (io.ReadCloser, er
 	}
 }
 
+// VerifyPassword checks plaintext against the share's stored bcrypt hash.
+// Return values:
+//   - nil — the password matches
+//   - ErrNoPassword (wrapped) — the share has no password set; calling
+//     VerifyPassword on it is a caller-side control-flow bug (the caller
+//     should check PasswordHash == nil first and skip the prompt entirely)
+//   - ErrPasswordMismatch (wrapped) — bcrypt rejected the plaintext
+//   - any other error (wrapped) — a corrupt or malformed hash; operationally
+//     this means the row is unusable and needs manual investigation
+//
+// This method returns error rather than bool so the three distinct "not a
+// match" states stay distinguishable at the call site via errors.Is.
+func (s *Service) VerifyPassword(sh *Share, plaintext string) error {
+	if sh.PasswordHash == nil {
+		return fmt.Errorf("verify password %q: %w", sh.ID, ErrNoPassword)
+	}
+	err := bcrypt.CompareHashAndPassword([]byte(*sh.PasswordHash), []byte(plaintext))
+	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+		return fmt.Errorf("verify password %q: %w", sh.ID, ErrPasswordMismatch)
+	}
+	if err != nil {
+		return fmt.Errorf("verify password %q: %w", sh.ID, err)
+	}
+	return nil
+}
+
 // nullStringToPtr converts a sql.NullString into *string: nil when the
 // column was NULL, a fresh pointer to the string otherwise. Keeps the Scan
 // site free of boilerplate.

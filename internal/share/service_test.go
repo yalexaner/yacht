@@ -826,3 +826,88 @@ func TestOpenContent_UnknownKind(t *testing.T) {
 		t.Errorf("reader = %v, want nil", rc)
 	}
 }
+
+func TestVerifyPassword_Match(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "locked.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	// round-trip through Get so we verify against a Share hydrated from the
+	// DB (the hash that actually reaches callers), not the freshly-built
+	// struct returned by Create.
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if err := svc.VerifyPassword(got, "hunter2"); err != nil {
+		t.Errorf("VerifyPassword(correct) = %v, want nil", err)
+	}
+}
+
+func TestVerifyPassword_Mismatch(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "locked.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	err = svc.VerifyPassword(got, "wrong")
+	if err == nil {
+		t.Fatal("VerifyPassword(wrong) err = nil, want ErrPasswordMismatch")
+	}
+	if !errors.Is(err, ErrPasswordMismatch) {
+		t.Errorf("err = %v, want chain containing ErrPasswordMismatch", err)
+	}
+}
+
+func TestVerifyPassword_NoPassword(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:  userID,
+		Content: "no-password note",
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	err = svc.VerifyPassword(got, "anything")
+	if err == nil {
+		t.Fatal("VerifyPassword(no-password share) err = nil, want ErrNoPassword")
+	}
+	if !errors.Is(err, ErrNoPassword) {
+		t.Errorf("err = %v, want chain containing ErrNoPassword", err)
+	}
+}
