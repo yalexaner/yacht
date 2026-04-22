@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
 )
 
@@ -173,5 +176,64 @@ func TestBootstrapUsers_EmptyList(t *testing.T) {
 	}
 	if admins != nil {
 		t.Errorf("admins = %v, want nil on error", admins)
+	}
+}
+
+// newCommandTestBot returns a Bot pared down to the fields the command
+// handlers (/start, /help) read — only cfg.DefaultExpiry matters. Keeping the
+// fixture minimal avoids coupling command-handler tests to the eventual share
+// service + fake telegramAPI wiring that later tasks introduce.
+func newCommandTestBot(t *testing.T, expiry time.Duration) *Bot {
+	t.Helper()
+	return &Bot{
+		cfg: &config.Bot{
+			Shared: &config.Shared{DefaultExpiry: expiry},
+		},
+	}
+}
+
+// newTestMessage builds a minimal tgbotapi.Message with a chat ID populated.
+// Command handlers only read msg.Chat.ID, so leaving the other fields zeroed
+// keeps the setup focused and readable.
+func newTestMessage(chatID int64) *tgbotapi.Message {
+	return &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: chatID}}
+}
+
+func TestHandleStart_RendersBody(t *testing.T) {
+	b := newCommandTestBot(t, 24*time.Hour)
+
+	reply, err := b.handleStart(context.Background(), newTestMessage(12345))
+	if err != nil {
+		t.Fatalf("handleStart: %v", err)
+	}
+	if reply.ChatID != 12345 {
+		t.Errorf("reply.ChatID = %d, want 12345", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "Send me a file or text message") {
+		t.Errorf("reply.Text missing welcome prose; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "allowlisted") {
+		t.Errorf("reply.Text missing allowlist notice; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, (24 * time.Hour).String()) {
+		t.Errorf("reply.Text missing DefaultExpiry %q; got %q", (24 * time.Hour).String(), reply.Text)
+	}
+}
+
+func TestHandleHelp_MentionsAdminFuture(t *testing.T) {
+	b := newCommandTestBot(t, 24*time.Hour)
+
+	reply, err := b.handleHelp(context.Background(), newTestMessage(54321))
+	if err != nil {
+		t.Fatalf("handleHelp: %v", err)
+	}
+	if reply.ChatID != 54321 {
+		t.Errorf("reply.ChatID = %d, want 54321", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "Admin commands") {
+		t.Errorf("reply.Text missing admin-future notice; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "/allow") {
+		t.Errorf("reply.Text missing /allow reference; got %q", reply.Text)
 	}
 }
