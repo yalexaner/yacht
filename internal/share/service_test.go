@@ -498,3 +498,212 @@ func TestCreateFileShare_StorageFailurePreventsDBInsert(t *testing.T) {
 		t.Errorf("share rows after failed upload = %d, want 0", count)
 	}
 }
+
+func TestGet_HappyPath_FileShare(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	payload := []byte("payload for get")
+	created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "report.pdf",
+		MIMEType:         "application/pdf",
+		Size:             int64(len(payload)),
+		Content:          bytes.NewReader(payload),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.ID != created.ID {
+		t.Errorf("ID = %q, want %q", got.ID, created.ID)
+	}
+	if got.UserID != created.UserID {
+		t.Errorf("UserID = %d, want %d", got.UserID, created.UserID)
+	}
+	if got.Kind != KindFile {
+		t.Errorf("Kind = %q, want %q", got.Kind, KindFile)
+	}
+	if got.OriginalFilename == nil || *got.OriginalFilename != "report.pdf" {
+		t.Errorf("OriginalFilename = %v, want \"report.pdf\"", got.OriginalFilename)
+	}
+	if got.MIMEType == nil || *got.MIMEType != "application/pdf" {
+		t.Errorf("MIMEType = %v, want \"application/pdf\"", got.MIMEType)
+	}
+	if got.SizeBytes == nil || *got.SizeBytes != int64(len(payload)) {
+		t.Errorf("SizeBytes = %v, want %d", got.SizeBytes, len(payload))
+	}
+	if got.StorageKey == nil || *got.StorageKey != created.ID {
+		t.Errorf("StorageKey = %v, want %q", got.StorageKey, created.ID)
+	}
+	if got.TextContent != nil {
+		t.Errorf("TextContent = %v, want nil (file share)", got.TextContent)
+	}
+	if got.PasswordHash == nil || *got.PasswordHash != *created.PasswordHash {
+		t.Errorf("PasswordHash = %v, want %v", got.PasswordHash, created.PasswordHash)
+	}
+	if got.DownloadCount != 0 {
+		t.Errorf("DownloadCount = %d, want 0", got.DownloadCount)
+	}
+	// created.CreatedAt / ExpiresAt are already truncated to second via
+	// time.Unix during Create; Get reads the same second back — equality is
+	// the right check, not approximate matching.
+	if !got.CreatedAt.Equal(created.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, created.CreatedAt)
+	}
+	if !got.ExpiresAt.Equal(created.ExpiresAt) {
+		t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, created.ExpiresAt)
+	}
+}
+
+func TestGet_HappyPath_TextShare(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateTextShare(context.Background(), CreateTextOpts{
+		UserID:  userID,
+		Content: "a memorable note",
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.ID != created.ID {
+		t.Errorf("ID = %q, want %q", got.ID, created.ID)
+	}
+	if got.Kind != KindText {
+		t.Errorf("Kind = %q, want %q", got.Kind, KindText)
+	}
+	if got.TextContent == nil || *got.TextContent != "a memorable note" {
+		t.Errorf("TextContent = %v, want \"a memorable note\"", got.TextContent)
+	}
+	if got.StorageKey != nil {
+		t.Errorf("StorageKey = %v, want nil (text share)", got.StorageKey)
+	}
+	if got.OriginalFilename != nil {
+		t.Errorf("OriginalFilename = %v, want nil (text share)", got.OriginalFilename)
+	}
+	if got.MIMEType != nil {
+		t.Errorf("MIMEType = %v, want nil (text share)", got.MIMEType)
+	}
+	if got.SizeBytes != nil {
+		t.Errorf("SizeBytes = %v, want nil (text share)", got.SizeBytes)
+	}
+	if got.PasswordHash != nil {
+		t.Errorf("PasswordHash = %v, want nil (empty password)", got.PasswordHash)
+	}
+	if !got.CreatedAt.Equal(created.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, created.CreatedAt)
+	}
+	if !got.ExpiresAt.Equal(created.ExpiresAt) {
+		t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, created.ExpiresAt)
+	}
+}
+
+func TestGet_Missing(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	got, err := svc.Get(context.Background(), "nosuchid")
+	if err == nil {
+		t.Fatal("Get err = nil, want ErrNotFound")
+	}
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want chain containing ErrNotFound", err)
+	}
+	if got != nil {
+		t.Errorf("share = %+v, want nil", got)
+	}
+}
+
+func TestGet_Expired(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	// bypass the Service's computed expiry by inserting a row whose
+	// expires_at is already in the past. This is the only way to produce an
+	// "expired at read time" state deterministically without sleeping.
+	pastExpires := time.Now().Add(-1 * time.Hour).Unix()
+	createdAt := time.Now().Add(-2 * time.Hour).Unix()
+	id := "expired1"
+	_, err := handle.ExecContext(context.Background(), `
+		INSERT INTO shares
+			(id, user_id, kind, text_content, created_at, expires_at, download_count)
+		VALUES (?, ?, 'text', 'stale', ?, ?, 0)
+	`, id, userID, createdAt, pastExpires)
+	if err != nil {
+		t.Fatalf("insert expired row: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), id)
+	if err == nil {
+		t.Fatal("Get err = nil, want ErrExpired")
+	}
+	if !errors.Is(err, ErrExpired) {
+		t.Errorf("err = %v, want chain containing ErrExpired", err)
+	}
+	if got != nil {
+		t.Errorf("share = %+v, want nil", got)
+	}
+}
+
+func TestGet_ExpiresAtBoundary(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	// Boundary: the Service uses time.Time.Before (strict "<") so a share
+	// whose expires_at equals the current second is still live. These two
+	// inserts lock that semantic in:
+	//   - expires_at = now + 1h  → live (clearly in the future)
+	//   - expires_at = now - 1s  → expired (clearly in the past)
+	// The "exactly at now" case is covered by the strict-< code path and
+	// exercised implicitly by the sub-second gap between insertion and Get
+	// in the happy-path tests above (both CreatedAt and ExpiresAt are within
+	// one second of time.Now() there, and Get returns the share).
+	future := time.Now().Add(1 * time.Hour).Unix()
+	futureID := "future01"
+	_, err := handle.ExecContext(context.Background(), `
+		INSERT INTO shares
+			(id, user_id, kind, text_content, created_at, expires_at, download_count)
+		VALUES (?, ?, 'text', 'live', strftime('%s','now'), ?, 0)
+	`, futureID, userID, future)
+	if err != nil {
+		t.Fatalf("insert future row: %v", err)
+	}
+
+	if _, err := svc.Get(context.Background(), futureID); err != nil {
+		t.Errorf("Get(future) err = %v, want nil", err)
+	}
+
+	past := time.Now().Add(-1 * time.Second).Unix()
+	pastID := "justpast"
+	_, err = handle.ExecContext(context.Background(), `
+		INSERT INTO shares
+			(id, user_id, kind, text_content, created_at, expires_at, download_count)
+		VALUES (?, ?, 'text', 'stale', strftime('%s','now'), ?, 0)
+	`, pastID, userID, past)
+	if err != nil {
+		t.Fatalf("insert past row: %v", err)
+	}
+
+	got, err := svc.Get(context.Background(), pastID)
+	if err == nil {
+		t.Fatal("Get(past) err = nil, want ErrExpired")
+	}
+	if !errors.Is(err, ErrExpired) {
+		t.Errorf("err = %v, want chain containing ErrExpired", err)
+	}
+	if got != nil {
+		t.Errorf("share = %+v, want nil", got)
+	}
+}

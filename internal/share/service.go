@@ -305,3 +305,84 @@ func (s *Service) CreateTextShare(ctx context.Context, opts CreateTextOpts) (*Sh
 		DownloadCount: 0,
 	}, nil
 }
+
+// Get fetches a share by ID. It distinguishes three states:
+//   - the row doesn't exist → ErrNotFound (wrapped)
+//   - the row exists but its expires_at has already passed → ErrExpired
+//     (wrapped, returned Share is nil — callers must not use an expired
+//     share's content)
+//   - the row exists and is live → (*Share, nil)
+//
+// The expiry comparison uses strict "<" (via time.Time.Before): a share
+// whose expires_at exactly equals the current second is still considered
+// live. Since expires_at is stored at second resolution, this gives callers
+// a full sub-second grace window on the boundary rather than tripping
+// ErrExpired the instant the clock ticks over.
+//
+// Cleanup of expired rows is async (see Phase 8), so expired rows linger in
+// the table — surfacing them as ErrExpired rather than ErrNotFound lets
+// callers show the user "this share has expired" instead of the more
+// alarming "this share never existed".
+func (s *Service) Get(ctx context.Context, id string) (*Share, error) {
+	var (
+		share                          Share
+		originalFilename, mimeType     sql.NullString
+		textContent, storageKey, hash  sql.NullString
+		sizeBytes                      sql.NullInt64
+		createdAt, expiresAt           int64
+	)
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, user_id, kind, original_filename, mime_type, size_bytes,
+		       text_content, storage_key, password_hash,
+		       created_at, expires_at, download_count
+		FROM shares
+		WHERE id = ?
+	`, id).Scan(
+		&share.ID, &share.UserID, &share.Kind,
+		&originalFilename, &mimeType, &sizeBytes,
+		&textContent, &storageKey, &hash,
+		&createdAt, &expiresAt, &share.DownloadCount,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("get %q: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get %q: %w", id, err)
+	}
+
+	share.OriginalFilename = nullStringToPtr(originalFilename)
+	share.MIMEType = nullStringToPtr(mimeType)
+	share.SizeBytes = nullInt64ToPtr(sizeBytes)
+	share.TextContent = nullStringToPtr(textContent)
+	share.StorageKey = nullStringToPtr(storageKey)
+	share.PasswordHash = nullStringToPtr(hash)
+	share.CreatedAt = time.Unix(createdAt, 0).UTC()
+	share.ExpiresAt = time.Unix(expiresAt, 0).UTC()
+
+	if share.ExpiresAt.Before(time.Now()) {
+		return nil, fmt.Errorf("get %q: %w", id, ErrExpired)
+	}
+	return &share, nil
+}
+
+// nullStringToPtr converts a sql.NullString into *string: nil when the
+// column was NULL, a fresh pointer to the string otherwise. Keeps the Scan
+// site free of boilerplate.
+func nullStringToPtr(ns sql.NullString) *string {
+	if !ns.Valid {
+		return nil
+	}
+	s := ns.String
+	return &s
+}
+
+// nullInt64ToPtr converts a sql.NullInt64 into *int64: nil when the column
+// was NULL, a fresh pointer to the value otherwise.
+func nullInt64ToPtr(ni sql.NullInt64) *int64 {
+	if !ni.Valid {
+		return nil
+	}
+	v := ni.Int64
+	return &v
+}
