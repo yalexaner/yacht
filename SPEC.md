@@ -200,12 +200,17 @@ type ObjectInfo struct {
     Size        int64
     ContentType string
 }
+
+var ErrNotFound = errors.New("storage: object not found")
 ```
+
+Missing-object contract: backends MUST return an error satisfying `errors.Is(err, ErrNotFound)` from `Get` and `Delete` when the key does not exist. Callers use `errors.Is` — never equality or a type assertion — so backends may wrap the sentinel with context without breaking consumers.
 
 Implementations:
 
 - `internal/storage/local/` — writes to `STORAGE_LOCAL_PATH`
 - `internal/storage/r2/` — uses AWS SDK v2 with R2 endpoint
+- `internal/storage/factory/` — selects the impl based on `STORAGE_BACKEND` (sibling package to avoid a storage → local/r2 → storage import cycle)
 
 Interface stays minimal — no presigned URLs, no lifecycle rules, nothing backend-specific. Backend-specific features (e.g. R2 lifecycle as expiry safety net) are configured outside the app.
 
