@@ -86,24 +86,24 @@
 ## Phase 4: Storage layer
 
 ### Interface + local backend
-- [ ] `internal/storage/storage.go` — `Storage` interface and `ObjectInfo` type
-- [ ] `internal/storage/local/local.go`:
-  - [ ] `Put` writes to `<root>/<key>` with parent dir creation
-  - [ ] `Get` opens file, returns reader + info
-  - [ ] `Delete` removes file
-  - [ ] Handle missing files cleanly (`os.IsNotExist` → typed error)
-- [ ] Unit tests using `t.TempDir()`
+- [x] `internal/storage/storage.go` — `Storage` interface and `ObjectInfo` type
+- [x] `internal/storage/local/local.go`:
+  - [x] `Put` writes to `<root>/<key>` with parent dir creation
+  - [x] `Get` opens file, returns reader + info
+  - [x] `Delete` removes file
+  - [x] Handle missing files cleanly (`os.IsNotExist` → typed error)
+- [x] Unit tests using `t.TempDir()`
 
 ### R2 backend
-- [ ] `internal/storage/r2/r2.go` using `aws-sdk-go-v2`:
-  - [ ] Client construction with R2 endpoint + credentials
-  - [ ] `Put` via `s3.PutObject`
-  - [ ] `Get` via `s3.GetObject`
-  - [ ] `Delete` via `s3.DeleteObject`
+- [x] `internal/storage/r2/r2.go` using `aws-sdk-go-v2`:
+  - [x] Client construction with R2 endpoint + credentials
+  - [x] `Put` via `s3.PutObject`
+  - [x] `Get` via `s3.GetObject`
+  - [x] `Delete` via `s3.DeleteObject`
 - [ ] Manual integration test against real R2 bucket (small upload/download/delete)
 
 ### Factory
-- [ ] `internal/storage/factory.go` — `New(cfg)` returns the right impl based on `STORAGE_BACKEND`
+- [x] `internal/storage/factory/factory.go` — `New(ctx, cfg)` returns the right impl based on `STORAGE_BACKEND` (sibling package to avoid the storage → local/r2 → storage import cycle)
 
 ---
 
