@@ -510,6 +510,39 @@ func TestCleanup_ActiveLoginTokenUntouched(t *testing.T) {
 	}
 }
 
+// TestCleanup_CancelledContextReturnsPromptly locks in the shutdown
+// contract relied on by cmd/web's ticker goroutine: when the signal-aware
+// ctx is cancelled, an in-flight Cleanup pass unblocks quickly rather than
+// running to completion. Every DB/storage call in Cleanup is ctx-aware, so
+// the very first QueryContext against an already-cancelled ctx surfaces
+// context.Canceled wrapped through fmt.Errorf. The test pre-cancels, calls
+// Cleanup, and asserts the error chain plus a wall-clock bound so a future
+// refactor that accidentally blocks on a non-ctx primitive fails loudly.
+func TestCleanup_CancelledContextReturnsPromptly(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// one second is roughly 1000x the expected return time on any machine
+	// that can run this test suite at all — plenty of headroom without
+	// letting a regression hide behind "eh, tests are slow".
+	const bound = 1 * time.Second
+	start := time.Now()
+	_, err := svc.Cleanup(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("Cleanup(cancelled ctx) err = nil, want non-nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false, err = %v", err)
+	}
+	if elapsed > bound {
+		t.Errorf("Cleanup took %s on cancelled ctx, want < %s", elapsed, bound)
+	}
+}
+
 // recordingDeleteStorage wraps a real backend so tests can assert whether
 // Delete was invoked (and with which keys). Put and Get are straight
 // passthroughs; only Delete is instrumented.
