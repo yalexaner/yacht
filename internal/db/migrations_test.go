@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
 	"path/filepath"
 	"reflect"
@@ -262,6 +263,8 @@ CREATE TABLE invalid FROM;`),
 		Scan(&name)
 	if err == nil {
 		t.Errorf("good_table exists after rollback; rollback did not undo earlier statement")
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("lookup good_table after rollback: %v", err)
 	}
 }
 
