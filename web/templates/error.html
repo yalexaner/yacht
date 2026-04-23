@@ -1,1 +1,6 @@
-{{define "content"}}<!-- placeholder, fleshed out in task 3 -->{{end}}
+{{define "title"}}{{.Title}} — yacht{{end}}
+{{define "content"}}
+<h1>{{.Title}}</h1>
+<p>{{.Message}}</p>
+<p><a href="/">Home</a></p>
+{{end}}

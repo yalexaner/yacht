@@ -15,6 +15,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log/slog"
+	"net/http"
 
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/share"
@@ -32,7 +33,7 @@ import (
 type Server struct {
 	cfg       *config.Web
 	share     *share.Service
-	templates *template.Template
+	templates map[string]*template.Template
 	static    fs.FS
 	logger    *slog.Logger
 }
@@ -71,4 +72,30 @@ func New(cfg *config.Web, share *share.Service, logger *slog.Logger) (*Server, e
 		static:    staticFS,
 		logger:    logger,
 	}, nil
+}
+
+// Routes assembles the HTTP handler that cmd/web feeds to http.Server. It
+// uses Go 1.22 pattern routing so method and path live in the pattern
+// string; a bare "/{id}" is necessarily GET because POST uses the explicit
+// "POST /{id}" entry. Routes that later Phase-7 tasks fill in are bound to
+// a 501 placeholder so a partially-deployed binary fails loud instead of
+// 404-ing.
+//
+// Static assets are served by http.FileServer over the sub-rooted FS that
+// New already stripped; StripPrefix peels the "/static/" segment so the
+// file server resolves "/static/style.css" against "style.css" inside the
+// FS — anything missing produces a plain 404 without touching the rest of
+// the handler stack.
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /healthz", s.healthzHandler)
+
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.static))))
+
+	mux.HandleFunc("GET /{id}", s.shareHandler)
+	mux.HandleFunc("POST /{id}", s.notImplementedHandler)
+	mux.HandleFunc("GET /d/{id}", s.notImplementedHandler)
+
+	return mux
 }

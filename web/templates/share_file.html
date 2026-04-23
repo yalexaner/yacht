@@ -1,1 +1,6 @@
-{{define "content"}}<!-- placeholder, fleshed out in task 3 -->{{end}}
+{{define "title"}}{{.Filename}} — yacht{{end}}
+{{define "content"}}
+<h1>{{.Filename}}</h1>
+<p class="meta">{{humanBytes .Size}} · expires {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
+<p><a class="btn" href="/d/{{.ID}}">Download</a></p>
+{{end}}

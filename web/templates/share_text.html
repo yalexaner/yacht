@@ -1,1 +1,7 @@
-{{define "content"}}<!-- placeholder, fleshed out in task 3 -->{{end}}
+{{define "title"}}Text share — yacht{{end}}
+{{define "content"}}
+<h1>Text share</h1>
+<p class="meta">expires {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
+<pre>{{.Content}}</pre>
+<p><a class="btn" href="/d/{{.ID}}">Download as .txt</a></p>
+{{end}}
