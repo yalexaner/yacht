@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -81,11 +82,10 @@ func parseTemplates(fsys fs.FS) (map[string]*template.Template, error) {
 	return out, nil
 }
 
-// render writes the standard text/html headers and executes the requested
-// page template within its cloned base. Execution failures are logged
-// rather than propagated because the response status + headers may already
-// have been flushed by the time the template engine errors out — at that
-// point the best we can do is leave a trail for the operator.
+// render executes the requested page template into a buffer before touching
+// the response so a mid-render failure can still return a clean 500 instead
+// of a 2xx with truncated HTML. Buffering is cheap — every Phase-7 page is
+// well under 10 KB — and the correctness win is worth it.
 func (s *Server) render(w http.ResponseWriter, status int, name string, data any) {
 	tmpl, ok := s.templates[name]
 	if !ok {
@@ -93,9 +93,13 @@ func (s *Server) render(w http.ResponseWriter, status int, name string, data any
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	var buf bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&buf, "base.html", data); err != nil {
+		s.logger.Error("render template", "name", name, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	if err := tmpl.ExecuteTemplate(w, "base.html", data); err != nil {
-		s.logger.Error("render template", "name", name, "err", err)
-	}
+	_, _ = w.Write(buf.Bytes())
 }

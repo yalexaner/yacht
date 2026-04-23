@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"io"
 	"log/slog"
@@ -318,7 +319,7 @@ func TestShare_FileWithPasswordValidCookie(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/"+created.ID, nil)
-	req.AddCookie(&http.Cookie{Name: "yacht_share_" + created.ID, Value: "1"})
+	req.AddCookie(&http.Cookie{Name: "yacht_share_" + created.ID, Value: unlockCookieValue(t, svc, created.ID)})
 	rec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(rec, req)
 
@@ -329,6 +330,49 @@ func TestShare_FileWithPasswordValidCookie(t *testing.T) {
 	for _, want := range []string{"secret.bin", "Download", "/d/" + created.ID} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q; got:\n%s", want, body)
+		}
+	}
+}
+
+// TestShare_FileWithPasswordForgedCookie: a visitor who knows only the share
+// id cannot bypass password verification by sending a hand-crafted cookie.
+// The server derives the expected cookie value from the share's bcrypt hash,
+// so naive guesses like the literal "1" (the Phase-7 prototype value) fail
+// the constant-time compare and the prompt still renders.
+func TestShare_FileWithPasswordForgedCookie(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	// try every trivial forgery a naive attacker would attempt: "1" is the
+	// Phase-7 prototype token, an empty value and a long junk value round out
+	// the set. None should grant access.
+	for _, forged := range []string{"1", "", strings.Repeat("a", 32)} {
+		req := httptest.NewRequest(http.MethodGet, "/"+created.ID, nil)
+		req.AddCookie(&http.Cookie{Name: "yacht_share_" + created.ID, Value: forged})
+		rec := httptest.NewRecorder()
+		srv.Routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("forged=%q: status want 401, got %d", forged, rec.Code)
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), "Password required") {
+			t.Errorf("forged=%q: body missing password prompt; got:\n%s", forged, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), "secret.bin") {
+			t.Errorf("forged=%q: body leaked filename; got:\n%s", forged, rec.Body.String())
 		}
 	}
 }
@@ -379,6 +423,22 @@ func findCookie(rec *httptest.ResponseRecorder, target string) *http.Cookie {
 	return nil
 }
 
+// unlockCookieValue computes the value that the password handler would have
+// set for a successful verification against the share id's stored hash.
+// Tests that want to bypass the POST round-trip and jump straight to "already
+// unlocked" state use this to build a genuine cookie the server will accept.
+func unlockCookieValue(t *testing.T, svc *share.Service, id string) string {
+	t.Helper()
+	sh, err := svc.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get share for cookie token: %v", err)
+	}
+	if sh.PasswordHash == nil {
+		t.Fatalf("share %q has no password hash — cannot derive unlock cookie", id)
+	}
+	return shareCookieToken(*sh.PasswordHash)
+}
+
 // TestPassword_Correct: a matching password sets the unlock cookie with the
 // expected scope (Path=/, SameSite=Strict, HttpOnly, Max-Age=300) and 303-
 // redirects the browser back to GET /{id}. The redirect target is a relative
@@ -413,8 +473,8 @@ func TestPassword_Correct(t *testing.T) {
 	if c == nil {
 		t.Fatalf("unlock cookie not set; Set-Cookie headers: %v", rec.Header().Values("Set-Cookie"))
 	}
-	if c.Value != "1" {
-		t.Errorf("cookie value: want %q, got %q", "1", c.Value)
+	if want := unlockCookieValue(t, svc, created.ID); c.Value != want {
+		t.Errorf("cookie value: want %q (hash-derived token), got %q", want, c.Value)
 	}
 	if c.Path != "/" {
 		t.Errorf("cookie path: want %q, got %q", "/", c.Path)
@@ -427,6 +487,75 @@ func TestPassword_Correct(t *testing.T) {
 	}
 	if c.MaxAge != 300 {
 		t.Errorf("cookie MaxAge: want 300, got %d", c.MaxAge)
+	}
+}
+
+// TestPassword_CorrectSecureCookieOverTLS: the unlock cookie must carry
+// the Secure flag whenever the request arrived over TLS — directly
+// (r.TLS != nil) or via a reverse proxy that terminated TLS and set
+// X-Forwarded-Proto=https. Missing Secure here lets an on-path attacker on
+// plain HTTP capture and replay the cookie for the 5-minute window, which
+// would defeat the whole point of the bearer-token redesign.
+func TestPassword_CorrectSecureCookieOverTLS(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		setup       func(r *http.Request)
+		wantSecure  bool
+	}{
+		{
+			name:       "plain HTTP → Secure not set",
+			setup:      func(*http.Request) {},
+			wantSecure: false,
+		},
+		{
+			name: "X-Forwarded-Proto=https → Secure set",
+			setup: func(r *http.Request) {
+				r.Header.Set("X-Forwarded-Proto", "https")
+			},
+			wantSecure: true,
+		},
+		{
+			name: "direct TLS (r.TLS != nil) → Secure set",
+			setup: func(r *http.Request) {
+				r.TLS = &tls.ConnectionState{}
+			},
+			wantSecure: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := postPasswordRequest(t, created.ID, "hunter2")
+			tc.setup(req)
+			rec := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusSeeOther {
+				t.Fatalf("status: want 303, got %d; body=%q", rec.Code, rec.Body.String())
+			}
+			c := findCookie(rec, "yacht_share_"+created.ID)
+			if c == nil {
+				t.Fatalf("unlock cookie not set")
+			}
+			if c.Secure != tc.wantSecure {
+				t.Errorf("cookie Secure: want %v, got %v", tc.wantSecure, c.Secure)
+			}
+		})
 	}
 }
 
@@ -522,6 +651,45 @@ func TestPassword_ExpiredShare(t *testing.T) {
 	}
 }
 
+// TestPassword_OversizedBody: a POST body larger than passwordFormMaxBytes
+// must be rejected at 400 rather than streamed into memory by ParseForm.
+// Prevents a trivial DoS where an attacker pipes gigabytes of form data
+// into the unauthenticated endpoint.
+func TestPassword_OversizedBody(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	// build a form body comfortably over the 4 KB cap by stuffing a long
+	// value into the password field. The ParseForm call downstream should
+	// fail against the MaxBytesReader wrap before bcrypt ever runs.
+	big := strings.Repeat("a", 8*1024)
+	form := url.Values{}
+	form.Set("password", big)
+	req := httptest.NewRequest(http.MethodPost, "/"+created.ID, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if c := findCookie(rec, "yacht_share_"+created.ID); c != nil {
+		t.Errorf("unlock cookie should NOT be set on oversized body; got %+v", c)
+	}
+}
+
 // TestPassword_ShareWithoutPassword: POST /{id} against an unprotected share
 // should never happen via the normal UX (the share page skips the prompt),
 // so surface as 400 rather than silently redirecting or landing a cookie.
@@ -587,6 +755,9 @@ func TestDownload_File(t *testing.T) {
 	if cl := rec.Header().Get("Content-Length"); cl != "11" {
 		t.Errorf("content-length: want %q, got %q", "11", cl)
 	}
+	if xcto := rec.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
+		t.Errorf("x-content-type-options: want %q, got %q", "nosniff", xcto)
+	}
 	cd := rec.Header().Get("Content-Disposition")
 	for _, want := range []string{
 		`attachment;`,
@@ -639,6 +810,9 @@ func TestDownload_Text(t *testing.T) {
 	}
 	if cl := rec.Header().Get("Content-Length"); cl != "13" {
 		t.Errorf("content-length: want %q, got %q", "13", cl)
+	}
+	if xcto := rec.Header().Get("X-Content-Type-Options"); xcto != "nosniff" {
+		t.Errorf("x-content-type-options: want %q, got %q", "nosniff", xcto)
 	}
 	wantCD := `attachment; filename="` + created.ID + `.txt"`
 	if cd := rec.Header().Get("Content-Disposition"); cd != wantCD {
@@ -819,7 +993,7 @@ func TestDownload_WithPasswordValidCookie(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/d/"+created.ID, nil)
-	req.AddCookie(&http.Cookie{Name: "yacht_share_" + created.ID, Value: "1"})
+	req.AddCookie(&http.Cookie{Name: "yacht_share_" + created.ID, Value: unlockCookieValue(t, svc, created.ID)})
 	rec := httptest.NewRecorder()
 	srv.Routes().ServeHTTP(rec, req)
 

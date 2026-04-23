@@ -2,6 +2,9 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +23,12 @@ import (
 // the next occupant. Phase 9 replaces this cookie with a real signed session
 // and can tune the window without changing the handler contract.
 const shareCookieMaxAge = 5 * time.Minute
+
+// passwordFormMaxBytes caps the password POST body so an attacker can't
+// tie up memory streaming gigabytes into ParseForm. A few KB is an order of
+// magnitude above any legitimate password submission and leaves no room for
+// mistakes when the form gains fields in later phases.
+const passwordFormMaxBytes = 4 * 1024
 
 // fileShareView is the data contract between shareHandler and
 // share_file.html. Handlers precompute Filename/Size/ExpiresAt as plain
@@ -71,22 +80,16 @@ func (s *Server) healthzHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-// notImplementedHandler is a placeholder the mux uses for routes that later
-// Phase-7 tasks will flesh out. We return 501 rather than 404 so that a
-// half-deployed binary produces a clearly diagnostic response instead of
-// looking like a missing route.
-func (s *Server) notImplementedHandler(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
-}
-
 // shareHandler serves GET /{id}: the share landing page. It resolves the
 // share through share.Service, maps the sentinel errors to HTTP statuses,
 // gates on the per-share password cookie when the share is protected, and
 // renders the file or text view template based on the share's Kind.
 //
-// The password check here is a UX gate, not a security boundary: the actual
-// password is verified on POST /{id} (Task 4), which sets the cookie this
-// handler reads. Download in Task 5 uses the same check.
+// The password itself is verified on POST /{id} (Task 4), which sets the
+// unlock cookie this handler reads. The cookie value is a SHA-256 of the
+// per-share bcrypt hash, so only a client that has completed the POST flow
+// can carry a valid one — a visitor who merely knows the share ID is still
+// blocked at the prompt. Download in Task 5 uses the same check.
 func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -102,7 +105,7 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sh.PasswordHash != nil && !s.hasShareCookie(r, id) {
+	if sh.PasswordHash != nil && !s.hasShareCookie(r, sh) {
 		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{ID: id})
 		return
 	}
@@ -140,9 +143,11 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 // than silently redirect so a future regression that starts posting to
 // unprotected shares surfaces instead of leaking a cookie.
 //
-// Cookie scope: Path=/, SameSite=Strict, HttpOnly, Max-Age=300. No Secure
-// flag in Phase 7 — the cookie value is the literal "1" and carries no
-// secret; the real gate is bcrypt, and Phase 14 polish can revisit.
+// Cookie scope: Path=/, SameSite=Strict, HttpOnly, Max-Age=300, Secure when
+// the request arrived over TLS (direct r.TLS or X-Forwarded-Proto=https from
+// the Phase-13 Caddy front). The cookie value is a real bearer token derived
+// from the bcrypt hash, so a plaintext-HTTP leak would let an on-path
+// attacker replay it for the 5-minute window — Secure is what prevents that.
 func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -165,6 +170,7 @@ func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, passwordFormMaxBytes)
 	if err := r.ParseForm(); err != nil {
 		s.logger.Error("password form parse failed", "id", id, "err", err)
 		s.renderError(w, http.StatusBadRequest, "Bad Request", "Could not read the submitted form.")
@@ -177,13 +183,17 @@ func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 	case err == nil:
 		// success — set the unlock cookie and send the browser back to the
 		// share page via POST-redirect-GET. The GET sees the cookie via
-		// hasShareCookie and renders the share view.
+		// hasShareCookie and renders the share view. The cookie value is
+		// derived from the stored bcrypt hash so it can only be produced
+		// after a real password verification — a client that merely guesses
+		// the share ID cannot forge it.
 		http.SetCookie(w, &http.Cookie{
 			Name:     shareCookieName(id),
-			Value:    "1",
+			Value:    shareCookieToken(*sh.PasswordHash),
 			Path:     "/",
 			MaxAge:   int(shareCookieMaxAge.Seconds()),
 			HttpOnly: true,
+			Secure:   requestIsTLS(r),
 			SameSite: http.SameSiteStrictMode,
 		})
 		http.Redirect(w, r, "/"+id, http.StatusSeeOther)
@@ -223,24 +233,56 @@ func (s *Server) renderError(w http.ResponseWriter, status int, title, message s
 	s.render(w, status, "error.html", errorView{Title: title, Message: message})
 }
 
-// shareCookieName returns the per-share trust-cookie name set by the
+// shareCookieName returns the per-share unlock-cookie name set by the
 // password handler and read here + by the download handler. Phase 9
 // replaces this with a signed session cookie; for Phase 7 the value is
-// the unsigned literal "1" and its only job is to remember that the
-// browser already submitted the correct password for this specific share.
+// shareCookieToken(passwordHash) — a fingerprint of the per-share bcrypt
+// hash, which a client who knows only the share ID cannot produce.
 func shareCookieName(id string) string {
 	return "yacht_share_" + id
 }
 
+// shareCookieToken derives the unlock-cookie value from the share's stored
+// bcrypt hash. bcrypt generates a fresh random salt per hash, so the output
+// is unique per share and unreachable to anyone without the hash itself.
+// Taking SHA-256 of the hash and truncating to 16 bytes (32 hex chars) keeps
+// the cookie small while leaving 128 bits of collision resistance — orders
+// of magnitude beyond any realistic forgery attempt. Phase 9 replaces this
+// with a proper signed session cookie.
+func shareCookieToken(passwordHash string) string {
+	sum := sha256.Sum256([]byte(passwordHash))
+	return hex.EncodeToString(sum[:16])
+}
+
+// requestIsTLS reports whether the request arrived over TLS — either
+// directly (r.TLS != nil) or via a reverse proxy that terminated TLS and
+// signalled it with X-Forwarded-Proto=https. The Phase-13 Caddy front sets
+// this header authoritatively; trusting it from arbitrary clients is fine
+// here because the worst an attacker achieves by forging it is marking their
+// own Set-Cookie as Secure, which is a self-DOS, not an escalation.
+func requestIsTLS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
 // hasShareCookie reports whether r carries a valid password-unlock cookie
-// for shareID. The cookie is a UX skip-token, not a credential — the real
-// gate is bcrypt on POST — so any present-and-equal-to-"1" cookie counts.
-func (s *Server) hasShareCookie(r *http.Request, shareID string) bool {
-	c, err := r.Cookie(shareCookieName(shareID))
+// for sh. The cookie value must match shareCookieToken(*sh.PasswordHash)
+// byte-for-byte; comparing in constant time keeps a timing oracle off the
+// table. Returns false for shares without a password set — callers should
+// only reach this check when sh.PasswordHash != nil, but defending here
+// keeps the contract explicit.
+func (s *Server) hasShareCookie(r *http.Request, sh *share.Share) bool {
+	if sh.PasswordHash == nil {
+		return false
+	}
+	c, err := r.Cookie(shareCookieName(sh.ID))
 	if err != nil {
 		return false
 	}
-	return c.Value == "1"
+	expected := shareCookieToken(*sh.PasswordHash)
+	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(expected)) == 1
 }
 
 // downloadHandler serves GET /d/{id}: the actual download stream. It reuses
@@ -275,7 +317,7 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sh.PasswordHash != nil && !s.hasShareCookie(r, id) {
+	if sh.PasswordHash != nil && !s.hasShareCookie(r, sh) {
 		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{ID: id})
 		return
 	}
@@ -323,6 +365,11 @@ func (s *Server) streamFileShare(w http.ResponseWriter, r *http.Request, sh *sha
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	}
 	w.Header().Set("Content-Disposition", rfc5987ContentDisposition(filename))
+	// nosniff neutralizes the MIME-sniff fallback that lets some browsers
+	// render an uploaded .html/.svg file inline despite Content-Disposition:
+	// attachment. Uploader-supplied mime types reach clients unchanged, so a
+	// malicious upload without this header could be a drive-by XSS surface.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 
 	if _, err := io.Copy(w, body); err != nil {
@@ -343,6 +390,7 @@ func (s *Server) streamTextShare(w http.ResponseWriter, r *http.Request, sh *sha
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, sh.ID+".txt"))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 
 	if _, err := io.WriteString(w, content); err != nil {

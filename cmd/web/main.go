@@ -146,6 +146,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
+	// drain serveErr non-blockingly: if Serve failed concurrently with
+	// ctx cancellation, the goroutine's result would otherwise sit
+	// unread and the operator would never know.
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			logger.Warn("serve exited during shutdown", "err", err)
+		}
+	default:
+	}
 	return nil
 }
 
