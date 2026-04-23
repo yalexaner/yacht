@@ -36,6 +36,12 @@ const shutdownTimeout = 5 * time.Second
 // forever without this. Ten seconds is generous for any real browser.
 const readHeaderTimeout = 10 * time.Second
 
+// cleanupInterval is how often the background GC goroutine runs share.Service.Cleanup.
+// Five minutes matches SPEC § Background Workers. Env-configurability is a Phase 14
+// polish concern; hardcoding keeps the operational surface small until a real need
+// for tuning appears.
+const cleanupInterval = 5 * time.Minute
+
 // run loads the web configuration, opens the SQLite database, applies any
 // pending schema migrations, constructs the storage backend, builds the
 // share service and web server, binds the listener, and blocks in the
@@ -126,6 +132,40 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			return
 		}
 		serveErr <- nil
+	}()
+
+	// background GC worker. Runs once immediately so a restart picks up any
+	// rows that expired during downtime, then on a ticker every
+	// cleanupInterval. No dedicated cancellation primitive: the same
+	// signal-aware ctx from main drives both the HTTP server and this loop,
+	// and every DB/storage call inside Cleanup is ctx-aware, so SIGINT/SIGTERM
+	// unblocks an in-flight pass promptly without a separate WaitGroup.
+	logger.Info("cleanup worker started", "interval", cleanupInterval.String())
+	go func() {
+		runCleanup := func() {
+			stats, err := shareSvc.Cleanup(ctx)
+			if err != nil {
+				logger.Error("cleanup cycle", "err", err)
+				return
+			}
+			logger.Info("cleanup",
+				"shares", stats.SharesDeleted,
+				"sessions", stats.SessionsDeleted,
+				"login_tokens", stats.LoginTokensDeleted,
+				"errors", stats.Errors,
+			)
+		}
+		runCleanup()
+		t := time.NewTicker(cleanupInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runCleanup()
+			}
+		}
 	}()
 
 	select {
