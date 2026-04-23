@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yalexaner/yacht/internal/db"
 )
@@ -69,9 +70,21 @@ func TestRun_HappyPath(t *testing.T) {
 	// MkdirAll inside local.New to succeed.
 	env["STORAGE_BACKEND"] = "local"
 	env["STORAGE_LOCAL_PATH"] = filepath.Join(tmp, "objects")
+	// bind to an ephemeral port so parallel test runs — or a real server
+	// already listening on 8080 — can't conflict with the test.
+	env["HTTP_LISTEN"] = "127.0.0.1:0"
 	applyEnv(t, env)
 
-	if err := run(context.Background(), discardLogger()); err != nil {
+	// run now blocks in http.Server.Serve until ctx is cancelled. Give it
+	// enough time to complete startup (templates parse, listener bind,
+	// goroutine dispatch) then cancel to exercise the graceful-shutdown
+	// path. 500ms is comfortably above the ~sub-millisecond startup cost
+	// on any modern machine while staying well under a test's default
+	// timeout budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	if err := run(ctx, discardLogger()); err != nil {
 		t.Fatalf("run returned unexpected error: %v", err)
 	}
 
@@ -92,7 +105,7 @@ func TestRun_HappyPath(t *testing.T) {
 
 // assertMigrated reopens the DB at dbPath and fails the test if
 // schema_migrations has zero rows. Proves that run() called db.Migrate,
-// not just db.New — os.Stat alone can't distinguish the two.
+// not just db.New — osStat alone can't distinguish the two.
 func assertMigrated(t *testing.T, dbPath string) {
 	t.Helper()
 	ctx := context.Background()
@@ -129,6 +142,34 @@ func TestRun_MissingRequiredVar(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "BASE_URL") {
 		t.Errorf("err should mention BASE_URL, got %q", err.Error())
+	}
+}
+
+// TestRun_ListenFails drives the net.Listen failure path: a malformed
+// HTTP_LISTEN value (missing port) causes the bind step to fail. The
+// returned error must be wrapped with the "listen" prefix so operators can
+// tell at a glance that the listener bind, not an earlier startup step,
+// failed.
+func TestRun_ListenFails(t *testing.T) {
+	env := validWebEnv()
+	tmp := t.TempDir()
+	env["DB_PATH"] = filepath.Join(tmp, "meta.db")
+	env["STORAGE_BACKEND"] = "local"
+	env["STORAGE_LOCAL_PATH"] = filepath.Join(tmp, "objects")
+	// net.Listen rejects addresses with no ":" — the resolver reports
+	// "missing port in address". Any value the config layer accepts but
+	// net.Listen rejects reaches this code path.
+	env["HTTP_LISTEN"] = "not-a-valid-addr"
+	applyEnv(t, env)
+
+	err := run(context.Background(), discardLogger())
+	if err == nil {
+		t.Fatal("want error for malformed HTTP_LISTEN, got nil")
+	}
+	// lock in the "listen" prefix specifically so a regression that swaps
+	// wraps (or bubbles a raw net.OpError) fails this test.
+	if !strings.Contains(err.Error(), "listen") {
+		t.Errorf("err should mention \"listen\", got %q", err.Error())
 	}
 }
 

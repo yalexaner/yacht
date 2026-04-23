@@ -1,31 +1,58 @@
 // Package main is the entrypoint for the yacht web binary. Phase 2 loads
 // configuration and logs a safe view of it; Phase 3 adds the SQLite open +
 // migration step on startup; Phase 4 adds the storage backend construction
-// step; the HTTP server lands in a later phase.
+// step; Phase 7 wires share.Service and the HTTP server on top, then blocks
+// in ListenAndServe until SIGINT/SIGTERM cancels the context and triggers a
+// graceful Shutdown.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
+	"github.com/yalexaner/yacht/internal/share"
 	"github.com/yalexaner/yacht/internal/storage/factory"
+	"github.com/yalexaner/yacht/internal/web"
 )
 
+// shutdownTimeout bounds how long graceful shutdown can take after ctx is
+// cancelled. Five seconds is enough for the in-flight downloads we ship in
+// Phase 7 (streaming from local disk or R2) while short enough that a stuck
+// request can't wedge a deploy indefinitely.
+const shutdownTimeout = 5 * time.Second
+
+// readHeaderTimeout is cheap Slowloris insurance: a client that opens a
+// connection and dribbles headers one byte at a time can tie up a goroutine
+// forever without this. Ten seconds is generous for any real browser.
+const readHeaderTimeout = 10 * time.Second
+
 // run loads the web configuration, opens the SQLite database, applies any
-// pending schema migrations, constructs the storage backend, and returns. It
-// is split out from main so tests can drive it with a discard logger and
-// t.Setenv without touching os.Exit.
+// pending schema migrations, constructs the storage backend, builds the
+// share service and web server, binds the listener, and blocks in the
+// HTTP serve loop until ctx is cancelled. It is split out from main so
+// tests can drive startup with a discard logger and t.Setenv without
+// touching os.Exit.
 //
-// Order matters: config first (so we know which DB path and storage backend
-// to use), then the DB open + ping (so permission / path errors surface here
-// rather than on the first request), then migrations (so by the time the
-// server loop lands in a later phase every table it needs already exists),
-// then storage (so credential / filesystem misconfiguration surfaces at boot
-// rather than on the first upload).
+// Order matters: config first (so we know which DB path, storage backend,
+// and listen address to use), then the DB open + ping (so permission /
+// path errors surface here rather than on the first request), then
+// migrations (so by the time the first request lands every table it needs
+// already exists), then storage (so credential / filesystem
+// misconfiguration surfaces at boot rather than on the first download),
+// then share (a pure wrapper over db + storage), then web (parses
+// templates eagerly so a malformed template crashes the binary at boot
+// rather than 500ing on the first request), then the listener (so a
+// bad HTTP_LISTEN surfaces before any goroutines spawn).
 func run(ctx context.Context, logger *slog.Logger) error {
 	cfg, err := config.LoadWeb()
 	if err != nil {
@@ -63,16 +90,75 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// method because neither backend holds a resource that needs one — the
 	// local backend is stateless, and the S3 client pools connections
 	// internally. Do not "fix" this by adding a Close.
-	_ = store // will be threaded into handlers in Phase 7.
-
 	factory.LogReady(logger, cfg.Shared)
 
+	shareSvc := share.New(handle, store, cfg.Shared)
+
+	srv, err := web.New(cfg, shareSvc, logger)
+	if err != nil {
+		return fmt.Errorf("init web: %w", err)
+	}
+
+	// Bind the listener ourselves (rather than letting http.Server do it
+	// via ListenAndServe) for two reasons: first, Listen failures surface
+	// synchronously here with the "listen" wrap, not inside a goroutine
+	// where the operator would only see a raw net.OpError; second, tests
+	// can set HTTP_LISTEN=127.0.0.1:0 and read the actual bound port off
+	// ln.Addr() if they ever need to hit the server.
+	ln, err := net.Listen("tcp", cfg.HTTPListen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.HTTPListen, err)
+	}
+
+	httpSrv := &http.Server{
+		Handler:           srv.Routes(),
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
+	logger.Info("web ready", "listen", ln.Addr().String())
+
+	// serveErr carries an unexpected Serve error out of the goroutine so
+	// run can return it. The buffered size of 1 prevents a leak if run
+	// exits via the ctx path before the goroutine writes.
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		// normal shutdown path: SIGINT/SIGTERM or test-driven cancel.
+	case err := <-serveErr:
+		// Serve exited on its own, before ctx cancellation. Either an
+		// unexpected error (bubble up wrapped) or a clean close via an
+		// external Shutdown we didn't initiate (return nil).
+		if err != nil {
+			return fmt.Errorf("serve: %w", err)
+		}
+		return nil
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
 	return nil
 }
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	if err := run(context.Background(), logger); err != nil {
+	// SIGINT + SIGTERM trigger a graceful shutdown: the signal cancels ctx,
+	// run's select unblocks, http.Server.Shutdown drains in-flight
+	// requests, deferred cleanups (db.Close) fire, and main exits 0.
+	// cancel() on defer prevents a goroutine leak if run() returns before
+	// a signal arrives.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	if err := run(ctx, logger); err != nil {
 		logger.Error("web startup failed", "err", err)
 		os.Exit(1)
 	}
