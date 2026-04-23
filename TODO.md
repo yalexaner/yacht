@@ -137,12 +137,12 @@
 
 ## Phase 7: Web binary — download endpoint
 
-- [ ] `internal/web/server.go` — HTTP server with Go 1.22 mux
-- [ ] Route `GET /{id}` → share page (file: name + download button; text: rendered + download-as-txt)
-- [ ] Route `POST /{id}` → password validation form submission
-- [ ] Route `GET /d/{id}` → stream with `Content-Disposition: attachment`
-- [ ] Route `GET /healthz` → 200 OK
-- [ ] Templates: base layout, share-file, share-text, password prompt, expired/not-found
+- [x] `internal/web/server.go` — HTTP server with Go 1.22 mux
+- [x] Route `GET /{id}` → share page (file: name + download button; text: rendered + download-as-txt)
+- [x] Route `POST /{id}` → password validation form submission
+- [x] Route `GET /d/{id}` → stream with `Content-Disposition: attachment`
+- [x] Route `GET /healthz` → 200 OK
+- [x] Templates: base layout, share-file, share-text, password prompt, expired/not-found
 - [ ] Manual test: open bot-uploaded URL in browser → see page → download works
 
 ---
