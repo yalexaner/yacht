@@ -149,14 +149,14 @@
 
 ## Phase 8: Cleanup worker
 
-- [ ] `internal/share/cleanup.go` — `(*Service).Cleanup(ctx)` method:
-  - [ ] Query expired shares
-  - [ ] `storage.Delete` then `db.DeleteShare` for each
-  - [ ] Clear expired sessions
-  - [ ] Clear used/expired login_tokens
-  - [ ] Log counts
-- [ ] `cmd/web/main.go` launches as goroutine with 5-min ticker
-- [ ] Test: insert share with `expires_at` in the past, run cleanup, verify deletion in storage + DB
+- [x] `internal/share/cleanup.go` — `(*Service).Cleanup(ctx)` method:
+  - [x] Query expired shares
+  - [x] `storage.Delete` then `db.DeleteShare` for each
+  - [x] Clear expired sessions
+  - [x] Clear used/expired login_tokens
+  - [x] Log counts
+- [x] `cmd/web/main.go` launches as goroutine with 5-min ticker
+- [x] Test: insert share with `expires_at` in the past, run cleanup, verify deletion in storage + DB
 
 ---
 
