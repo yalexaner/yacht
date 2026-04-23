@@ -835,6 +835,43 @@ func TestDownload_WithPasswordValidCookie(t *testing.T) {
 	}
 }
 
+// TestLogMiddleware_CapturesStatus: the request logger must reflect the
+// handler's chosen status, not a stale default. A teapot response is used
+// because it's an unmistakable value no existing handler emits, so any match
+// in the buffered log proves the status recorder is threading the handler's
+// WriteHeader call through correctly.
+func TestLogMiddleware_CapturesStatus(t *testing.T) {
+	var buf bytes.Buffer
+	cfg := &config.Web{Shared: &config.Shared{}}
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	srv, err := New(cfg, nil, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	handler := srv.logMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/brew", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("downstream status: want 418, got %d", rec.Code)
+	}
+	log := buf.String()
+	for _, want := range []string{
+		`"status":418`,
+		`"method":"GET"`,
+		`"path":"/brew"`,
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log missing %q; got: %s", want, log)
+		}
+	}
+}
+
 // TestShare_Expired: a row that exists but whose expires_at is in the past
 // must surface as 410 Gone — not 404. The distinction matters because a
 // user following a known-good URL that has since expired needs a different

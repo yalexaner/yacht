@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/share"
@@ -97,5 +98,48 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /{id}", s.passwordHandler)
 	mux.HandleFunc("GET /d/{id}", s.downloadHandler)
 
-	return mux
+	return s.logMiddleware(mux)
+}
+
+// statusRecorder snapshots the outgoing HTTP status so logMiddleware can log
+// it after the handler returns. http.ResponseWriter doesn't expose the status
+// once WriteHeader runs, and a handler that never calls WriteHeader relies on
+// the stdlib's implicit-200-on-first-Write contract — we mirror that here so
+// the logged value matches what the client actually receives.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+// logMiddleware emits one INFO line per request with method, path, status,
+// and wall-clock duration. It's the only observability surface Phase 13 has
+// until proper metrics land, so every route — including /healthz — goes
+// through it; noisy liveness probes are preferable to a deployment where we
+// can't tell whether a request ever reached the binary.
+func (s *Server) logMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		s.logger.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration", time.Since(start),
+		)
+	})
 }
