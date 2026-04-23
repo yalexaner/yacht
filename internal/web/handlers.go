@@ -8,6 +8,14 @@ import (
 	"github.com/yalexaner/yacht/internal/share"
 )
 
+// shareCookieMaxAge bounds the lifetime of the per-share unlock cookie. Five
+// minutes is long enough for a user to page around after unlocking (refresh,
+// hit Download, reopen the tab) without having to re-enter the password, and
+// short enough that a shared machine doesn't leave a lingering skip-token for
+// the next occupant. Phase 9 replaces this cookie with a real signed session
+// and can tune the window without changing the handler contract.
+const shareCookieMaxAge = 5 * time.Minute
+
 // fileShareView is the data contract between shareHandler and
 // share_file.html. Handlers precompute Filename/Size/ExpiresAt as plain
 // values so the template never has to deref pointers — the Share struct
@@ -114,6 +122,77 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 		// operator investigates rather than silently rendering an empty page.
 		s.logger.Error("unknown share kind", "id", id, "kind", sh.Kind)
 		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "We could not display this share.")
+	}
+}
+
+// passwordHandler serves POST /{id}: the password form submission. It
+// resolves the share, maps the same sentinel errors as shareHandler, verifies
+// the plaintext against the stored bcrypt hash, and — on success — sets the
+// short-lived unlock cookie and redirects to GET /{id} (POST-redirect-GET).
+//
+// A share without a stored hash reaching this handler is a caller-side bug
+// (the share page never renders the prompt for it), but we return 400 rather
+// than silently redirect so a future regression that starts posting to
+// unprotected shares surfaces instead of leaking a cookie.
+//
+// Cookie scope: Path=/, SameSite=Strict, HttpOnly, Max-Age=300. No Secure
+// flag in Phase 7 — the cookie value is the literal "1" and carries no
+// secret; the real gate is bcrypt, and Phase 14 polish can revisit.
+func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		return
+	}
+
+	sh, err := s.share.Get(r.Context(), id)
+	if err != nil {
+		s.renderShareError(w, r, err)
+		return
+	}
+
+	if sh.PasswordHash == nil {
+		// defense-in-depth: the share page never shows the prompt for an
+		// unprotected share, so reaching here means a client posted directly.
+		// Surface as 400 rather than silently proceeding so the oddity shows
+		// up in logs instead of landing a cookie on every visitor.
+		s.renderError(w, http.StatusBadRequest, "Bad Request", "This share is not password protected.")
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		s.logger.Error("password form parse failed", "id", id, "err", err)
+		s.renderError(w, http.StatusBadRequest, "Bad Request", "Could not read the submitted form.")
+		return
+	}
+	plaintext := r.PostForm.Get("password")
+
+	err = s.share.VerifyPassword(sh, plaintext)
+	switch {
+	case err == nil:
+		// success — set the unlock cookie and send the browser back to the
+		// share page via POST-redirect-GET. The GET sees the cookie via
+		// hasShareCookie and renders the share view.
+		http.SetCookie(w, &http.Cookie{
+			Name:     shareCookieName(id),
+			Value:    "1",
+			Path:     "/",
+			MaxAge:   int(shareCookieMaxAge.Seconds()),
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		http.Redirect(w, r, "/"+id, http.StatusSeeOther)
+		return
+	case errors.Is(err, share.ErrPasswordMismatch):
+		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{
+			ID:    id,
+			Error: "Incorrect password",
+		})
+		return
+	default:
+		s.logger.Error("verify password failed", "id", id, "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
 	}
 }
 

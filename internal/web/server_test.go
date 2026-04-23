@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -350,6 +351,205 @@ func TestShare_Missing(t *testing.T) {
 	}
 	if !strings.Contains(body, "<h1>") {
 		t.Errorf("body missing error.html layout; got:\n%s", body)
+	}
+}
+
+// postPasswordRequest builds a POST /{id} request with an
+// application/x-www-form-urlencoded body carrying the supplied password.
+// Shared between the password-flow tests so a future rewrite of the form
+// shape (e.g. adding a CSRF token) only touches one place.
+func postPasswordRequest(t *testing.T, id, password string) *http.Request {
+	t.Helper()
+	form := url.Values{}
+	form.Set("password", password)
+	req := httptest.NewRequest(http.MethodPost, "/"+id, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req
+}
+
+// findCookie returns the first Set-Cookie response cookie whose name matches
+// target, or nil if none was set. httptest.ResponseRecorder exposes the raw
+// Set-Cookie headers via Result(); http.Response.Cookies() parses them.
+func findCookie(rec *httptest.ResponseRecorder, target string) *http.Cookie {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == target {
+			return c
+		}
+	}
+	return nil
+}
+
+// TestPassword_Correct: a matching password sets the unlock cookie with the
+// expected scope (Path=/, SameSite=Strict, HttpOnly, Max-Age=300) and 303-
+// redirects the browser back to GET /{id}. The redirect target is a relative
+// path so the response survives reverse-proxy rewrites.
+func TestPassword_Correct(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := postPasswordRequest(t, created.ID, "hunter2")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status: want 303, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/"+created.ID {
+		t.Errorf("location: want %q, got %q", "/"+created.ID, loc)
+	}
+	c := findCookie(rec, "yacht_share_"+created.ID)
+	if c == nil {
+		t.Fatalf("unlock cookie not set; Set-Cookie headers: %v", rec.Header().Values("Set-Cookie"))
+	}
+	if c.Value != "1" {
+		t.Errorf("cookie value: want %q, got %q", "1", c.Value)
+	}
+	if c.Path != "/" {
+		t.Errorf("cookie path: want %q, got %q", "/", c.Path)
+	}
+	if !c.HttpOnly {
+		t.Errorf("cookie HttpOnly: want true, got false")
+	}
+	if c.SameSite != http.SameSiteStrictMode {
+		t.Errorf("cookie SameSite: want Strict (%d), got %d", http.SameSiteStrictMode, c.SameSite)
+	}
+	if c.MaxAge != 300 {
+		t.Errorf("cookie MaxAge: want 300, got %d", c.MaxAge)
+	}
+}
+
+// TestPassword_Incorrect: a rejected password re-renders the prompt at 401
+// with the error banner populated, and crucially does NOT set an unlock
+// cookie — otherwise any POST would inflate the trust token pool.
+func TestPassword_Incorrect(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := postPasswordRequest(t, created.ID, "wrong")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status: want 401, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Password required",
+		"Incorrect password",
+		`action="/` + created.ID + `"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q; got:\n%s", want, body)
+		}
+	}
+	if c := findCookie(rec, "yacht_share_"+created.ID); c != nil {
+		t.Errorf("unlock cookie should NOT be set on failure; got %+v", c)
+	}
+}
+
+// TestPassword_MissingShare: POST /{id} for a share that doesn't exist
+// returns 404 using the same error.html mapping as shareHandler. The user
+// should never be able to tell from the response whether the share existed
+// and had a different password or didn't exist at all.
+func TestPassword_MissingShare(t *testing.T) {
+	srv, _, _ := newTestServerWithShare(t)
+
+	req := postPasswordRequest(t, "nosuchid", "anything")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status: want 404, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Not Found") {
+		t.Errorf("body missing 'Not Found'; got:\n%s", rec.Body.String())
+	}
+}
+
+// TestPassword_ExpiredShare: POST /{id} for a share whose expires_at has
+// passed returns 410 Gone — consistent with the GET mapping so the user's
+// experience doesn't depend on which request the expiry happened to race.
+func TestPassword_ExpiredShare(t *testing.T) {
+	srv, _, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	// bypass share.Service so we can set expires_at in the past; include a
+	// password_hash so we exercise the "expired then password check" order
+	// rather than short-circuiting on the no-password branch first.
+	pastExpires := time.Now().Add(-1 * time.Hour).Unix()
+	createdAt := time.Now().Add(-2 * time.Hour).Unix()
+	id := "expired2"
+	hash := "$2a$10$abcdefghijklmnopqrstuv" // shape-only; handler never reaches the compare path
+	_, err := handle.ExecContext(context.Background(), `
+		INSERT INTO shares
+			(id, user_id, kind, text_content, password_hash, created_at, expires_at, download_count)
+		VALUES (?, ?, 'text', 'stale', ?, ?, ?, 0)
+	`, id, userID, hash, createdAt, pastExpires)
+	if err != nil {
+		t.Fatalf("insert expired row: %v", err)
+	}
+
+	req := postPasswordRequest(t, id, "anything")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status: want 410, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPassword_ShareWithoutPassword: POST /{id} against an unprotected share
+// should never happen via the normal UX (the share page skips the prompt),
+// so surface as 400 rather than silently redirecting or landing a cookie.
+// Catches future regressions that might start posting to unprotected shares.
+func TestPassword_ShareWithoutPassword(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "open.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := postPasswordRequest(t, created.ID, "anything")
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if c := findCookie(rec, "yacht_share_"+created.ID); c != nil {
+		t.Errorf("unlock cookie should NOT be set for unprotected share; got %+v", c)
 	}
 }
 
