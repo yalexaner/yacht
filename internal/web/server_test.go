@@ -872,6 +872,46 @@ func TestLogMiddleware_CapturesStatus(t *testing.T) {
 	}
 }
 
+// TestShare_TextAutoEscapesHTML guards Phase 7's XSS story: user-supplied
+// text content goes through html/template into a <pre> block, so any markup
+// the uploader types — a <script> tag, an onerror payload, raw HTML — must
+// render as escaped text, not as live elements. Losing this would turn every
+// text share into an open redirect for script injection.
+func TestShare_TextAutoEscapesHTML(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	content := `<script>alert("pwned")</script>`
+	created, err := svc.CreateTextShare(context.Background(), share.CreateTextOpts{
+		UserID:  userID,
+		Content: content,
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/"+created.ID, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// the raw tag must never appear verbatim — if it did, a browser would
+	// execute it as a real <script>.
+	if strings.Contains(body, content) {
+		t.Errorf("body leaked raw script tag; got:\n%s", body)
+	}
+	// html/template emits &lt;script&gt; for < and > in text context.
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Errorf("body missing escaped <script> open tag; got:\n%s", body)
+	}
+	if !strings.Contains(body, "&lt;/script&gt;") {
+		t.Errorf("body missing escaped </script> close tag; got:\n%s", body)
+	}
+}
+
 // TestShare_Expired: a row that exists but whose expires_at is in the past
 // must surface as 410 Gone — not 404. The distinction matters because a
 // user following a known-good URL that has since expired needs a different
