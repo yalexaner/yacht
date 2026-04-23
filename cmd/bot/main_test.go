@@ -13,14 +13,15 @@ import (
 // validBotEnv mirrors the env map used in internal/config tests but lives
 // here as a small local helper so cmd/bot tests stay self-contained.
 //
-// DB_PATH defaults to a sentinel production path; individual tests that
-// actually drive run() should override it with a t.TempDir()-based path so
-// the real sqlite.Open + Migrate codepaths land against a writable file.
+// DB_PATH is deliberately omitted: tests that drive run() must set it to a
+// t.TempDir()-based path so the real sqlite.Open + Migrate codepaths land
+// against a writable file. Tests that exercise only config validation will
+// surface DB_PATH in the aggregated LoadBot error if unset — which is the
+// intended fail-loud behaviour for forgotten overrides.
 func validBotEnv() map[string]string {
 	return map[string]string{
 		"BASE_URL":             "https://send.example.com",
 		"BRAND_URL":            "https://brand.example.com",
-		"DB_PATH":              "/var/lib/yacht/meta.db",
 		"DEFAULT_LANG":         "en",
 		"DEFAULT_EXPIRY_HOURS": "24",
 		"MAX_UPLOAD_BYTES":     "104857600",
@@ -49,10 +50,9 @@ func discardLogger() *slog.Logger {
 
 func TestRun_HappyPath(t *testing.T) {
 	env := validBotEnv()
-	// override DB_PATH to point at a writable tempdir so run() actually
-	// exercises db.New + db.Migrate against a real SQLite file. The
-	// production sentinel path in validBotEnv would hit a permission
-	// error under `go test`.
+	// set DB_PATH to a writable tempdir so run() actually exercises
+	// db.New + db.Migrate against a real SQLite file. validBotEnv leaves
+	// DB_PATH unset so a forgotten override fails loudly in LoadBot.
 	dbPath := filepath.Join(t.TempDir(), "meta.db")
 	env["DB_PATH"] = dbPath
 	applyEnv(t, env)
