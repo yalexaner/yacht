@@ -30,6 +30,17 @@ func openTestDB(t *testing.T) *sql.DB {
 	return handle
 }
 
+// closeRows closes rows and fails the test if Close errors. Used via
+// `defer closeRows(t, rows)` for deferred closes and plain
+// `closeRows(t, rows)` for explicit closes in error paths — satisfies
+// errcheck without scattering inline err-check boilerplate.
+func closeRows(t *testing.T, rows *sql.Rows) {
+	t.Helper()
+	if err := rows.Close(); err != nil {
+		t.Errorf("rows.Close: %v", err)
+	}
+}
+
 // countSchemaMigrations returns the number of rows in schema_migrations.
 // Used by idempotency checks and as a sanity probe after rollback tests.
 func countSchemaMigrations(t *testing.T, ctx context.Context, db *sql.DB) int {
@@ -86,7 +97,7 @@ func TestMigrate_AppliesAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select schema_migrations: %v", err)
 	}
-	defer rows.Close()
+	defer closeRows(t, rows)
 	for rows.Next() {
 		var name string
 		var appliedAt int64
@@ -392,7 +403,7 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 			var nn int
 			var dflt sql.NullString
 			if err := rows.Scan(&c.name, &c.typ, &nn, &dflt, &c.pk); err != nil {
-				rows.Close()
+				closeRows(t, rows)
 				t.Fatalf("scan table_info for %q: %v", table, err)
 			}
 			c.notnull = nn != 0
@@ -403,10 +414,10 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 			got = append(got, c)
 		}
 		if err := rows.Err(); err != nil {
-			rows.Close()
+			closeRows(t, rows)
 			t.Fatalf("rows.Err for %q: %v", table, err)
 		}
-		rows.Close()
+		closeRows(t, rows)
 
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("table %q columns = %+v, want %+v", table, got, want)
@@ -498,7 +509,7 @@ func hasUniqueIndexOn(t *testing.T, ctx context.Context, db *sql.DB, table, colu
 	if err != nil {
 		t.Fatalf("pragma_index_list(%q): %v", table, err)
 	}
-	defer rows.Close()
+	defer closeRows(t, rows)
 	type idx struct {
 		name   string
 		unique int
@@ -530,12 +541,16 @@ func hasUniqueIndexOn(t *testing.T, ctx context.Context, db *sql.DB, table, colu
 
 // indexColumns returns the column names covered by the given index, in
 // index position order.
-func indexColumns(ctx context.Context, db *sql.DB, idxName string) ([]string, error) {
+func indexColumns(ctx context.Context, db *sql.DB, idxName string) (_ []string, err error) {
 	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, idxName)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	// errors.Join surfaces any close error alongside the iteration error;
+	// nil is a no-op so the happy path is unaffected.
+	defer func() {
+		err = errors.Join(err, rows.Close())
+	}()
 	var names []string
 	for rows.Next() {
 		var n string
