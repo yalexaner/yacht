@@ -43,6 +43,13 @@ func validWebEnv() map[string]string {
 
 func applyEnv(t *testing.T, vars map[string]string) {
 	t.Helper()
+	// If the test intentionally omits DB_PATH, clear any inherited value
+	// from the parent shell so LoadWeb sees it as missing. Without this,
+	// a developer who exports DB_PATH for local runs would silently bypass
+	// the fail-loud contract that validWebEnv establishes by omission.
+	if _, ok := vars["DB_PATH"]; !ok {
+		t.Setenv("DB_PATH", "")
+	}
 	for k, v := range vars {
 		t.Setenv(k, v)
 	}
@@ -141,8 +148,9 @@ func TestRun_UnwritableDBPath(t *testing.T) {
 	}
 	// lock in the "open database:" prefix specifically so a regression
 	// that swaps the wrap order (or mentions "database" only via the
-	// "migrate database:" wrap) fails this test.
-	if !strings.Contains(err.Error(), "open database") {
-		t.Errorf("err should mention \"open database\", got %q", err.Error())
+	// "migrate database:" wrap) fails this test. HasPrefix — not Contains —
+	// so a wrapped error like "migrate database: open database: ..." fails.
+	if !strings.HasPrefix(err.Error(), "open database:") {
+		t.Errorf("err should start with \"open database:\", got %q", err.Error())
 	}
 }
