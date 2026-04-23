@@ -48,9 +48,6 @@ func (c CleanupStats) String() string {
 // the top of this file for scope/idempotency guarantees. ctx is plumbed
 // through to every DB and storage call so the pass exits promptly when the
 // web binary receives SIGINT/SIGTERM mid-cycle.
-//
-// Task 4 will layer used/expired login-token deletes on top of the
-// expired-shares and expired-sessions passes implemented here.
 func (s *Service) Cleanup(ctx context.Context) (CleanupStats, error) {
 	var stats CleanupStats
 
@@ -59,6 +56,10 @@ func (s *Service) Cleanup(ctx context.Context) (CleanupStats, error) {
 	}
 
 	if err := s.cleanupExpiredSessions(ctx, &stats); err != nil {
+		return stats, err
+	}
+
+	if err := s.cleanupLoginTokens(ctx, &stats); err != nil {
 		return stats, err
 	}
 
@@ -168,5 +169,30 @@ func (s *Service) cleanupExpiredSessions(ctx context.Context, stats *CleanupStat
 		return fmt.Errorf("cleanup: expired sessions rows affected: %w", err)
 	}
 	stats.SessionsDeleted = n
+	return nil
+}
+
+// cleanupLoginTokens deletes every row in login_tokens that has reached
+// end-of-life — either used_at IS NOT NULL (single-use token that's been
+// redeemed, per SPEC § Auth → Login token) or expires_at < now (unused but
+// past its window). Both conditions are terminal: a used token can never be
+// reused and an expired-unused token can never be used, so neither belongs
+// in the live table. Collapsing them into one DELETE keeps the pass O(1)
+// queries even though they're conceptually distinct lifecycles. Like
+// sessions, there's no external side effect to clean up; a single statement
+// plus RowsAffected fully expresses the operation.
+func (s *Service) cleanupLoginTokens(ctx context.Context, stats *CleanupStats) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM login_tokens WHERE used_at IS NOT NULL OR expires_at < ?`,
+		time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("cleanup: delete login tokens: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("cleanup: login tokens rows affected: %w", err)
+	}
+	stats.LoginTokensDeleted = n
 	return nil
 }

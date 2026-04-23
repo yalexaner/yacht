@@ -93,6 +93,32 @@ func insertSessionRow(t *testing.T, handle *sql.DB, userID int64, expiresAtOffse
 	return id
 }
 
+// insertLoginToken inserts a row directly into the login_tokens table with
+// the given used_at and expires_at offsets (both relative to now; a nil
+// usedAtOffset leaves used_at NULL, a negative expires offset = expired).
+// Login tokens aren't produced by any code path until Phase 9 adds the
+// auth layer, so cleanup tests build the fixture by raw insert. Returns
+// the generated token so tests can assert row presence/absence.
+func insertLoginToken(t *testing.T, handle *sql.DB, userID int64, usedAtOffset *time.Duration, expiresAtOffset time.Duration) string {
+	t.Helper()
+
+	now := time.Now()
+	token := fmt.Sprintf("tok-%d", now.UnixNano())
+
+	var usedAt sql.NullInt64
+	if usedAtOffset != nil {
+		usedAt = sql.NullInt64{Int64: now.Add(*usedAtOffset).Unix(), Valid: true}
+	}
+
+	if _, err := handle.ExecContext(context.Background(),
+		`INSERT INTO login_tokens (token, user_id, used_at, expires_at, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		token, userID, usedAt, now.Add(expiresAtOffset).Unix(), now.Unix()); err != nil {
+		t.Fatalf("insertLoginToken: %v", err)
+	}
+	return token
+}
+
 // TestCleanup_ExpiredFileShare covers the storage-then-DB delete path for
 // a file share whose expires_at has passed. After Cleanup, both the
 // storage backend and the shares row must be gone, and stats must reflect
@@ -388,6 +414,99 @@ func TestCleanup_ActiveSessionUntouched(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("sessions row count for %q = %d, want 1", id, count)
+	}
+}
+
+// TestCleanup_UsedLoginToken covers the "single-use redeemed" branch of
+// the login_tokens cleanup: a token whose used_at is non-null must be
+// removed even if its expires_at still sits in the future, because a
+// redeemed token can never be redeemed again.
+func TestCleanup_UsedLoginToken(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+	usedAt := -1 * time.Minute // used a moment ago
+	token := insertLoginToken(t, handle, userID, &usedAt, 1*time.Hour)
+
+	stats, err := svc.Cleanup(context.Background())
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if stats.LoginTokensDeleted != 1 {
+		t.Errorf("LoginTokensDeleted = %d, want 1", stats.LoginTokensDeleted)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM login_tokens WHERE token = ?`, token).Scan(&count); err != nil {
+		t.Fatalf("count login_tokens: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("login_tokens row count for %q = %d, want 0", token, count)
+	}
+}
+
+// TestCleanup_ExpiredLoginToken covers the "unused but past its window"
+// branch: a token with used_at NULL and expires_at in the past must be
+// reaped so the table doesn't accumulate dead rows. This is the case that
+// mirrors the sessions cleanup lifecycle.
+func TestCleanup_ExpiredLoginToken(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+	token := insertLoginToken(t, handle, userID, nil, -1*time.Hour)
+
+	stats, err := svc.Cleanup(context.Background())
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if stats.LoginTokensDeleted != 1 {
+		t.Errorf("LoginTokensDeleted = %d, want 1", stats.LoginTokensDeleted)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM login_tokens WHERE token = ?`, token).Scan(&count); err != nil {
+		t.Fatalf("count login_tokens: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("login_tokens row count for %q = %d, want 0", token, count)
+	}
+}
+
+// TestCleanup_ActiveLoginTokenUntouched confirms the WHERE clause is
+// precise: a token that's both unused (used_at NULL) and unexpired
+// (expires_at in the future) survives the pass and stats stay at zero.
+func TestCleanup_ActiveLoginTokenUntouched(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+	token := insertLoginToken(t, handle, userID, nil, 1*time.Hour)
+
+	stats, err := svc.Cleanup(context.Background())
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if stats.LoginTokensDeleted != 0 {
+		t.Errorf("LoginTokensDeleted = %d, want 0", stats.LoginTokensDeleted)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM login_tokens WHERE token = ?`, token).Scan(&count); err != nil {
+		t.Fatalf("count login_tokens: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("login_tokens row count for %q = %d, want 1", token, count)
 	}
 }
 
