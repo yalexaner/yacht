@@ -453,6 +453,40 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 	if !strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 		t.Errorf("insert error = %v, want a foreign-key constraint error", err)
 	}
+
+	// end-to-end CHECK checks: kind and provider are documented closed sets
+	// in SPEC.md § Data Model; the migration declares CHECK constraints to
+	// enforce them at the schema layer. If either CHECK were silently
+	// dropped (migration drift, future transcription bug) these inserts
+	// would succeed and land garbage values the app never expects.
+	//
+	// Seed a valid user first so the shares FK passes — otherwise the FK
+	// would trip before the CHECK and mask a missing constraint.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users (telegram_id, is_admin, created_at) VALUES (?, ?, ?)`,
+		1, 0, 1); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO shares (id, user_id, kind, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		"bad_kind", 1, "invalid", 1, 2)
+	if err == nil {
+		t.Fatal("insert with invalid kind succeeded; CHECK on shares.kind not enforced")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "check constraint") {
+		t.Errorf("insert error = %v, want a CHECK constraint error", err)
+	}
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO sessions (id, user_id, provider, expires_at, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		"bad_provider", 1, "invalid", 2, 1)
+	if err == nil {
+		t.Fatal("insert with invalid provider succeeded; CHECK on sessions.provider not enforced")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "check constraint") {
+		t.Errorf("insert error = %v, want a CHECK constraint error", err)
+	}
 }
 
 // hasUniqueIndexOn reports whether the given table has a UNIQUE index
