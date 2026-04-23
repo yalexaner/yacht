@@ -70,6 +70,31 @@ func TestHTTPDownloader_Non2XX(t *testing.T) {
 	}
 }
 
+func TestHTTPDownloader_RedactsURLInErrors(t *testing.T) {
+	// url.Error.Error() formats as `<Op> "<URL>": <Err>` by default. Telegram
+	// file URLs embed the bot token (https://api.telegram.org/file/bot<TOKEN>/...),
+	// so any transient network error would leak the token into logs via the
+	// default wrap. Download must strip the URL before wrapping.
+	const secretURL = "https://api.telegram.org/file/bot12345:SUPERSECRET/file.txt"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := newHTTPDownloader().Download(ctx, secretURL)
+	if err == nil {
+		t.Fatal("Download returned nil error with pre-cancelled ctx, want error")
+	}
+	if strings.Contains(err.Error(), "SUPERSECRET") {
+		t.Errorf("error leaks bot token: %v", err)
+	}
+	if strings.Contains(err.Error(), "api.telegram.org") {
+		t.Errorf("error leaks URL host: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error no longer wraps context.Canceled after sanitization: %v", err)
+	}
+}
+
 func TestHTTPDownloader_ContextCancel(t *testing.T) {
 	// server that blocks until the request context is cancelled — simulates a
 	// slow Telegram file backend. Using request.Context lets the handler

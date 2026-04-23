@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -89,6 +90,15 @@ func (b *Bot) handleText(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.M
 // even on share-creation failure, which matters: CreateFileShare may fail
 // before consuming the reader (e.g. DB down during allocateShareID) and leaving
 // the HTTP connection unclosed would leak a socket on every failed upload.
+//
+// Telegram reports Document.FileName and Document.FileSize as optional fields,
+// so the handler cannot pass them straight through to share.CreateFileShare
+// without normalising first. Missing FileName is synthesised from FileUniqueID
+// (the stable per-file identifier Telegram always populates) so the share row
+// and download URL still carry something meaningful, and the authoritative
+// Size for persistence/upload is taken from the downloader's Content-Length
+// rather than Telegram's metadata — the downloader reads it off the actual
+// response, so it is correct even when Telegram omits FileSize.
 func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
 	doc := msg.Document
 	userID, ok := b.admins[msg.From.ID]
@@ -109,22 +119,72 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 
 	url, err := b.api.GetFileDirectURL(doc.FileID)
 	if err != nil {
-		b.logger.ErrorContext(ctx, "get file direct url", "err", err, "file_id", doc.FileID)
+		// GetFileDirectURL funnels through tgbotapi's MakeRequest →
+		// http.Client.Do — a transport failure returns a *url.Error whose
+		// Error() includes the bot-token-bearing endpoint URL. Redact before
+		// logging (see bot.go's Send redaction for the same pattern).
+		b.logger.ErrorContext(ctx, "get file direct url", "err", redactURL(err), "file_id", doc.FileID)
 		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
 	}
 
-	body, _, err := b.downloader.Download(ctx, url)
+	body, size, err := b.downloader.Download(ctx, url)
 	if err != nil {
 		b.logger.ErrorContext(ctx, "download document", "err", err, "file_id", doc.FileID)
 		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
 	}
 	defer body.Close()
 
+	// unknown Content-Length (http.Response.ContentLength == -1, e.g. chunked
+	// transfer) leaves us no authoritative size to enforce MaxUploadBytes
+	// against, and CreateFileShare rejects negative sizes outright. Telegram's
+	// file endpoint always populates Content-Length in practice, so reaching
+	// this branch signals an upstream anomaly worth surfacing in logs rather
+	// than letting it fall through as a cryptic "negative size" error.
+	if size < 0 {
+		b.logger.ErrorContext(ctx, "document rejected: unknown content length",
+			"telegram_id", msg.From.ID,
+			"filename", doc.FileName,
+			"file_id", doc.FileID,
+		)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	// post-download size guard: the pre-download check relies on Telegram's
+	// optional FileSize metadata, which may be 0 or under-report. The
+	// downloader's size is read off the actual HTTP response, so this is the
+	// authoritative check that enforces MaxUploadBytes before we hand the
+	// stream to share.CreateFileShare (which would otherwise persist it).
+	if size > b.cfg.MaxUploadBytes {
+		b.logger.InfoContext(ctx, "document rejected: too large after download",
+			"telegram_id", msg.From.ID,
+			"filename", doc.FileName,
+			"size", size,
+			"max", b.cfg.MaxUploadBytes,
+		)
+		replyBody := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		return tgbotapi.NewMessage(msg.Chat.ID, replyBody), nil
+	}
+
+	filename := doc.FileName
+	if filename == "" {
+		filename = doc.FileUniqueID
+	}
+
+	// Telegram's Document.MimeType is optional — some senders omit it entirely.
+	// Defaulting to application/octet-stream mirrors the synthesised-filename
+	// treatment and keeps the stored mime_type (and the R2 object's Content-Type
+	// header) from being an empty string, which breaks the phase-7 inline
+	// preview path for downloads.
+	mimeType := doc.MimeType
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
 	sh, err := b.share.CreateFileShare(ctx, share.CreateFileOpts{
 		UserID:           userID,
-		OriginalFilename: doc.FileName,
-		MIMEType:         doc.MimeType,
-		Size:             int64(doc.FileSize),
+		OriginalFilename: filename,
+		MIMEType:         mimeType,
+		Size:             size,
 		Content:          body,
 	})
 	if err != nil {
@@ -132,7 +192,7 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
 	}
 
-	return b.buildShareReply(msg.Chat.ID, share.KindFile, doc.FileName, int64(doc.FileSize), sh), nil
+	return b.buildShareReply(msg.Chat.ID, share.KindFile, filename, size, sh), nil
 }
 
 // handlePhoto persists an attached photo as a share and returns a success or
@@ -171,23 +231,51 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 
 	url, err := b.api.GetFileDirectURL(largest.FileID)
 	if err != nil {
-		b.logger.ErrorContext(ctx, "get file direct url", "err", err, "file_id", largest.FileID)
+		// see handleDocument for the redactURL rationale — same *url.Error
+		// token-leak hazard on transport failure.
+		b.logger.ErrorContext(ctx, "get file direct url", "err", redactURL(err), "file_id", largest.FileID)
 		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
 	}
 
-	body, _, err := b.downloader.Download(ctx, url)
+	body, size, err := b.downloader.Download(ctx, url)
 	if err != nil {
 		b.logger.ErrorContext(ctx, "download photo", "err", err, "file_id", largest.FileID)
 		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
 	}
 	defer body.Close()
 
+	// unknown Content-Length — see handleDocument for the rationale. Rejecting
+	// here keeps a chunked/streaming response from slipping into CreateFileShare
+	// as a negative size error.
+	if size < 0 {
+		b.logger.ErrorContext(ctx, "photo rejected: unknown content length",
+			"telegram_id", msg.From.ID,
+			"file_unique_id", largest.FileUniqueID,
+			"file_id", largest.FileID,
+		)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	// post-download size guard — see handleDocument for the same pattern and
+	// rationale (PhotoSize.FileSize is optional metadata; downloader size is
+	// authoritative).
+	if size > b.cfg.MaxUploadBytes {
+		b.logger.InfoContext(ctx, "photo rejected: too large after download",
+			"telegram_id", msg.From.ID,
+			"file_unique_id", largest.FileUniqueID,
+			"size", size,
+			"max", b.cfg.MaxUploadBytes,
+		)
+		replyBody := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		return tgbotapi.NewMessage(msg.Chat.ID, replyBody), nil
+	}
+
 	filename := largest.FileUniqueID + ".jpg"
 	sh, err := b.share.CreateFileShare(ctx, share.CreateFileOpts{
 		UserID:           userID,
 		OriginalFilename: filename,
 		MIMEType:         "image/jpeg",
-		Size:             int64(largest.FileSize),
+		Size:             size,
 		Content:          body,
 	})
 	if err != nil {
@@ -195,7 +283,7 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
 	}
 
-	return b.buildShareReply(msg.Chat.ID, share.KindFile, filename, int64(largest.FileSize), sh), nil
+	return b.buildShareReply(msg.Chat.ID, share.KindFile, filename, size, sh), nil
 }
 
 // buildShareReply formats the ✓-prefixed success reply used by every
@@ -208,8 +296,13 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 // "" and 0 and the KindText branch ignores them. Keeping one helper instead
 // of two avoids drift between file and text reply phrasing (expiry line,
 // checkmark prefix).
+//
+// TrimRight normalises a trailing slash on BaseURL so an operator setting
+// BASE_URL=https://example.com/ doesn't produce double-slashed share URLs
+// like https://example.com//abc12345. config.validateURL accepts the trailing
+// form, so the fix belongs here at the one consumption site.
 func (b *Bot) buildShareReply(chatID int64, kind, filename string, size int64, sh *share.Share) tgbotapi.MessageConfig {
-	url := b.cfg.BaseURL + "/" + sh.ID
+	url := strings.TrimRight(b.cfg.BaseURL, "/") + "/" + sh.ID
 	var body string
 	switch kind {
 	case share.KindFile:

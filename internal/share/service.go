@@ -275,7 +275,14 @@ func (s *Service) CreateFileShare(ctx context.Context, opts CreateFileOpts) (*Sh
 		// case, which is effectively all cases at personal scale). Swallow
 		// any Delete error: the orphan that remains is what the R2 60-day
 		// lifecycle is configured to catch.
-		_ = s.storage.Delete(ctx, id)
+		//
+		// Use a detached context so cleanup still runs when the caller's ctx
+		// has already been cancelled (client disconnect, shutdown). Bounded
+		// timeout keeps a slow Delete from stalling the handler return —
+		// cleanup is best-effort, not load-bearing.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		_ = s.storage.Delete(cleanupCtx, id)
+		cancel()
 		return nil, fmt.Errorf("create file share: insert: %w", err)
 	}
 

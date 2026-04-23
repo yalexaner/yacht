@@ -11,6 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -23,6 +27,22 @@ import (
 // before Telegram's edge will force-close the connection — shorter values
 // just burn requests for no benefit on a low-volume personal bot.
 const longPollTimeoutSeconds = 60
+
+// telegramHTTPTimeout caps every request tgbotapi makes through its shared
+// http.Client. Upstream's NewBotAPI installs a zero-timeout &http.Client{},
+// which means a stalled Telegram edge can hang GetFileDirectURL or Send
+// forever inside the serial dispatch loop — taking the bot offline for one
+// stuck call. The bound must exceed longPollTimeoutSeconds (60 s) so normal
+// long-poll cycles complete naturally; 90 s gives a ~30 s cushion for
+// Telegram's own response jitter while still capping worst-case stalls.
+const telegramHTTPTimeout = 90 * time.Second
+
+// ErrUpdatesClosed is returned by Run when the Telegram updates channel
+// closes while ctx is still live. The upstream tgbotapi poll goroutine only
+// closes the channel after StopReceivingUpdates or an unrecoverable error,
+// so surfacing this distinctly (rather than silently returning nil) lets the
+// caller log that the bot exited for a reason other than shutdown.
+var ErrUpdatesClosed = errors.New("bot: updates channel closed unexpectedly")
 
 // telegramAPI is the narrow subset of *tgbotapi.BotAPI the bot package uses.
 // Keeping the interface small lets tests substitute a fake without standing
@@ -83,9 +103,26 @@ func New(
 	downloader fileDownloader,
 	logger *slog.Logger,
 ) (*Bot, error) {
-	api, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
+	// Install our redacting wrapper as tgbotapi's package-level logger BEFORE
+	// any tgbotapi call runs. The upstream GetUpdatesChan retry loop emits
+	// `log.Println(err)` against this logger on every transient transport
+	// error, and the *url.Error formatting embeds the full long-poll URL —
+	// including the bot token — straight to stderr. SetLogger only fails on a
+	// nil logger, which we do not pass.
+	if err := tgbotapi.SetLogger(&tgLogger{log: logger}); err != nil {
+		return nil, fmt.Errorf("bot.New: install tgbotapi logger: %w", err)
+	}
+
+	// NewBotAPIWithClient swaps in our timeout-bounded http.Client instead of
+	// upstream's zero-timeout default. See telegramHTTPTimeout for the rationale.
+	httpClient := &http.Client{Timeout: telegramHTTPTimeout}
+	api, err := tgbotapi.NewBotAPIWithClient(cfg.TelegramBotToken, tgbotapi.APIEndpoint, httpClient)
 	if err != nil {
-		return nil, fmt.Errorf("bot.New: telegram client: %w", err)
+		// tgbotapi.NewBotAPIWithClient calls getMe, which funnels through
+		// http.Client.Do — a transport failure returns a *url.Error whose
+		// Error() includes the full endpoint URL with the bot token.
+		// redactURL strips the URL while preserving the wrapped cause.
+		return nil, fmt.Errorf("bot.New: telegram client: %w", redactURL(err))
 	}
 
 	admins, err := bootstrapUsers(ctx, db, cfg.TelegramAdminIDs)
@@ -138,11 +175,15 @@ func (b *Bot) Run(ctx context.Context) error {
 			return ctx.Err()
 		case update, ok := <-updates:
 			if !ok {
-				// channel closed (StopReceivingUpdates was called from
-				// elsewhere, or the upstream goroutine exited). Treat as
-				// a cancellation rather than a silent loop exit so the
-				// caller logs the shutdown.
-				return ctx.Err()
+				// channel closed. If ctx is already done, treat the close
+				// as a shutdown (ctx.Err() is non-nil). Otherwise the
+				// upstream poll goroutine closed the channel for an
+				// unrelated reason — surface that distinctly so main.go
+				// doesn't interpret a silent nil return as a clean exit.
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return ErrUpdatesClosed
 			}
 			b.handleUpdate(ctx, update)
 		}
@@ -166,7 +207,12 @@ func (b *Bot) Run(ctx context.Context) error {
 // wants to share; the caption-as-password use is explicitly deferred per
 // SPEC § Open Questions, so the caption is ignored in MVP.
 func (b *Bot) handleUpdate(ctx context.Context, update tgbotapi.Update) {
-	if update.Message == nil || update.Message.From == nil {
+	// Chat is required by Telegram's Message schema, but the Go library exposes
+	// it as *Chat — so a malformed upstream response could hand us a nil here,
+	// and every handler dereferences msg.Chat.ID to build a reply. A panic in
+	// handleUpdate would tear down the Run loop (no recover), taking the bot
+	// offline for a single malformed update. The guard is cheap insurance.
+	if update.Message == nil || update.Message.From == nil || update.Message.Chat == nil {
 		return
 	}
 	msg := update.Message
@@ -218,8 +264,11 @@ func (b *Bot) handleUpdate(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 	if _, err := b.api.Send(reply); err != nil {
+		// b.api.Send funnels through tgbotapi's MakeRequest → http.Client.Do —
+		// a transport failure returns a *url.Error whose Error() includes the
+		// full endpoint URL with the bot token. Redact before logging.
 		b.logger.ErrorContext(ctx, "send reply",
-			"err", err,
+			"err", redactURL(err),
 			"telegram_id", msg.From.ID,
 		)
 	}
@@ -259,4 +308,32 @@ RETURNING id`
 		admins[tgID] = rowID
 	}
 	return admins, nil
+}
+
+// botTokenRegex matches the `bot<id>:<secret>` fragment that appears in every
+// Telegram-API URL — both api.telegram.org/bot<TOKEN>/<method> and
+// api.telegram.org/file/bot<TOKEN>/<path>. Bot tokens are `<digits>:<auth>`
+// where auth is the base64-ish character set Telegram issues. We strip the
+// secret half before any tgbotapi-sourced string reaches operator logs.
+var botTokenRegex = regexp.MustCompile(`bot\d+:[A-Za-z0-9_-]+`)
+
+func redactToken(s string) string {
+	return botTokenRegex.ReplaceAllString(s, "bot[REDACTED]")
+}
+
+// tgLogger adapts *slog.Logger to tgbotapi.BotLogger and redacts bot tokens
+// from every formatted message. Without this wrapper the upstream library's
+// retry loop dumps the long-poll URL (token included) to stderr on every
+// transient network error — see the comment in bot.New for why this needs to
+// be installed before NewBotAPI runs.
+type tgLogger struct {
+	log *slog.Logger
+}
+
+func (l *tgLogger) Println(v ...any) {
+	l.log.Warn("tgbotapi", "msg", redactToken(strings.TrimRight(fmt.Sprintln(v...), "\n")))
+}
+
+func (l *tgLogger) Printf(format string, v ...any) {
+	l.log.Warn("tgbotapi", "msg", redactToken(strings.TrimRight(fmt.Sprintf(format, v...), "\n")))
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,10 +79,15 @@ var _ telegramAPI = (*fakeAPI)(nil)
 // calls slice lets tests assert which URLs the handler asked to download
 // (useful for document/photo tests that need to verify size-guard short-
 // circuits skipped the fetch entirely).
+//
+// sizeOverride lets tests decouple the returned size from the body length —
+// needed for the "unknown Content-Length" case (http.Response.ContentLength ==
+// -1 on chunked responses), which can't be expressed by len(body) alone.
 type fakeDownloader struct {
-	body  []byte
-	err   error
-	calls []string
+	body         []byte
+	err          error
+	calls        []string
+	sizeOverride *int64
 }
 
 func (f *fakeDownloader) Download(_ context.Context, url string) (io.ReadCloser, int64, error) {
@@ -89,7 +95,11 @@ func (f *fakeDownloader) Download(_ context.Context, url string) (io.ReadCloser,
 	if f.err != nil {
 		return nil, 0, f.err
 	}
-	return io.NopCloser(bytes.NewReader(f.body)), int64(len(f.body)), nil
+	size := int64(len(f.body))
+	if f.sizeOverride != nil {
+		size = *f.sizeOverride
+	}
+	return io.NopCloser(bytes.NewReader(f.body)), size, nil
 }
 
 var _ fileDownloader = (*fakeDownloader)(nil)
@@ -641,6 +651,207 @@ func TestHandleDocument_DownloadError(t *testing.T) {
 	}
 }
 
+func TestHandleDocument_EmptyFileName(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_noname"
+	tb.dl.body = []byte("no-filename-payload")
+
+	// Telegram's Document.FileName is optional — senders can route binary
+	// content through the Bot API without one. The handler must synthesise
+	// a filename rather than forward "" and trip CreateFileShare's
+	// empty-name guard, which would map a valid upload to the generic error.
+	doc := &tgbotapi.Document{
+		FileID:       "doc_noname",
+		FileUniqueID: "unique_noname",
+		MimeType:     "application/octet-stream",
+		FileSize:     len(tb.dl.body),
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "unique_noname") {
+		t.Errorf("reply.Text missing synthesised filename; got %q", reply.Text)
+	}
+	if strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text is the generic error; empty FileName should not fail: %q", reply.Text)
+	}
+
+	var filename string
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT original_filename FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&filename); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if filename != "unique_noname" {
+		t.Errorf("stored filename = %q, want %q (FileUniqueID synthesised)",
+			filename, "unique_noname")
+	}
+}
+
+func TestHandleDocument_EmptyMimeTypeDefaults(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_nomime"
+	tb.dl.body = []byte("mystery-bytes")
+
+	// Telegram's Document.MimeType is optional — some senders omit it. The
+	// handler must synthesise a safe default rather than propagate "" into
+	// the shares row and the R2 object Content-Type header (phase-7 downloads
+	// rely on a populated mime_type to serve the right Content-Type).
+	doc := &tgbotapi.Document{
+		FileID:   "doc_nomime",
+		FileName: "mystery.bin",
+		MimeType: "",
+		FileSize: len(tb.dl.body),
+	}
+
+	if _, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc)); err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	var mime string
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT mime_type FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&mime); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if mime != "application/octet-stream" {
+		t.Errorf("stored mime_type = %q, want %q (empty MimeType must default)",
+			mime, "application/octet-stream")
+	}
+}
+
+func TestHandleDocument_UsesDownloaderSize(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_sized"
+	tb.dl.body = []byte("nineteen-byte-body!") // 19 bytes
+
+	// Telegram's Document.FileSize is optional and, per the Bot API, can be
+	// missing or inaccurate. The downloader returns the authoritative
+	// Content-Length from the actual response — that's the value the share
+	// row (and the R2 PutObject ContentLength) must be built from, not the
+	// metadata claim.
+	doc := &tgbotapi.Document{
+		FileID:   "doc_sized",
+		FileName: "sized.bin",
+		MimeType: "application/octet-stream",
+		FileSize: 0, // Telegram omitted it
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text is the generic error; zero FileSize should not fail: %q", reply.Text)
+	}
+
+	var size int64
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT size_bytes FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&size); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if size != int64(len(tb.dl.body)) {
+		t.Errorf("stored size = %d, want %d (downloader size, not doc.FileSize)",
+			size, len(tb.dl.body))
+	}
+}
+
+func TestHandleDocument_TooLargeAfterDownload(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.MaxUploadBytes = 100
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_big"
+	tb.dl.body = bytes.Repeat([]byte("A"), 1000) // 1000 bytes > 100 max
+
+	// Telegram's FileSize is optional and can under-report. FileSize=0 slips
+	// past the pre-download guard, so the handler must enforce MaxUploadBytes
+	// against the downloader's authoritative size before persisting the share.
+	doc := &tgbotapi.Document{
+		FileID:   "doc_big",
+		FileName: "hidden_big.bin",
+		MimeType: "application/octet-stream",
+		FileSize: 0, // metadata claims zero
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "too large") {
+		t.Errorf("reply.Text missing too-large notice; got %q", reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (oversize download must not persist)", n)
+	}
+}
+
+func TestHandleDocument_UnknownContentLength(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_chunked"
+	tb.dl.body = []byte("chunked-response-bytes")
+
+	// http.Response.ContentLength is -1 when the upstream response omits a
+	// Content-Length header (e.g. chunked transfer). With the size guard alone
+	// the -1 slips past "> MaxUploadBytes", then CreateFileShare rejects it as
+	// a negative size. The handler must catch -1 explicitly so the user gets
+	// a logged operational error rather than a confusing service-layer one.
+	unknown := int64(-1)
+	tb.dl.sizeOverride = &unknown
+
+	doc := &tgbotapi.Document{
+		FileID:   "doc_chunked",
+		FileName: "chunked.bin",
+		MimeType: "application/octet-stream",
+		FileSize: len(tb.dl.body),
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (unknown size must not persist)", n)
+	}
+}
+
 func TestHandleDocument_ShareCreationError(t *testing.T) {
 	tb := newTestBot(t)
 	tb.api.fileURL = "https://api.telegram.org/file/bot_token/documents/file_ok"
@@ -831,6 +1042,174 @@ func TestHandlePhoto_TooLarge(t *testing.T) {
 	}
 }
 
+func TestHandlePhoto_UsesDownloaderSize(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_sized"
+	tb.dl.body = []byte("seventeen-bytes!!") // 17 bytes
+
+	// PhotoSize.FileSize is optional and unreliable — the downloader's
+	// Content-Length is the source of truth for the share row size and the
+	// downstream R2 PutObject ContentLength.
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_sized", FileUniqueID: "u_sized", FileSize: 0},
+	}
+
+	if _, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos)); err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	var size int64
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT size_bytes FROM shares WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&size); err != nil {
+		t.Fatalf("lookup persisted share: %v", err)
+	}
+	if size != int64(len(tb.dl.body)) {
+		t.Errorf("stored size = %d, want %d (downloader size, not FileSize)",
+			size, len(tb.dl.body))
+	}
+}
+
+func TestHandlePhoto_TooLargeAfterDownload(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.MaxUploadBytes = 100
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_big"
+	tb.dl.body = bytes.Repeat([]byte("A"), 1000) // 1000 bytes > 100 max
+
+	// PhotoSize.FileSize is optional; FileSize=0 slips past the pre-download
+	// guard, so the post-download authoritative check must reject the upload
+	// before it reaches CreateFileShare.
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_big", FileUniqueID: "u_big", FileSize: 0},
+	}
+
+	reply, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "too large") {
+		t.Errorf("reply.Text missing too-large notice; got %q", reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (oversize download must not persist)", n)
+	}
+}
+
+func TestHandlePhoto_UnknownContentLength(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_chunked"
+	tb.dl.body = []byte("chunked-photo-bytes")
+
+	// http.Response.ContentLength = -1 (e.g. chunked transfer) can't be reconciled
+	// with CreateFileShare's non-negative Size contract. Mirrors the document
+	// handler guard; keeps the failure path observable (logged as an operational
+	// error) instead of masquerading as a generic share-layer rejection.
+	unknown := int64(-1)
+	tb.dl.sizeOverride = &unknown
+
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_chunked", FileUniqueID: "u_chunked", FileSize: len(tb.dl.body)},
+	}
+
+	reply, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (unknown size must not persist)", n)
+	}
+}
+
+func TestHandlePhoto_DownloadError(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_err"
+	tb.dl.err = errors.New("simulated download failure")
+
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_err", FileUniqueID: "u_err", FileSize: 1024},
+	}
+
+	reply, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM shares`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("shares row count = %d, want 0 (failed download must not persist)", n)
+	}
+}
+
+func TestHandlePhoto_ShareCreationError(t *testing.T) {
+	tb := newTestBot(t)
+	tb.api.fileURL = "https://api.telegram.org/file/bot_token/photos/file_ok"
+	tb.dl.body = []byte("pretend-jpeg-bytes")
+
+	photos := []tgbotapi.PhotoSize{
+		{FileID: "photo_share_err", FileUniqueID: "u_share_err", FileSize: len(tb.dl.body)},
+	}
+
+	// force CreateFileShare to fail at allocateShareID by closing the DB
+	// handle before the call — mirrors TestHandleDocument_ShareCreationError.
+	if err := tb.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	reply, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+}
+
 // newCommandUpdate builds a /<cmd> update as Telegram would deliver it: the
 // message text is the full slash-prefixed command and a bot_command entity at
 // offset 0 spans the command token. Without the entity Message.IsCommand()
@@ -854,12 +1233,39 @@ func TestHandleUpdate_NilMessage(t *testing.T) {
 	tb := newTestBot(t)
 
 	tb.bot.handleUpdate(context.Background(), tgbotapi.Update{})
+
+	if len(tb.api.sent) != 0 {
+		t.Errorf("api.Send called %d times, want 0 (nil Message must be dropped)", len(tb.api.sent))
+	}
+}
+
+func TestHandleUpdate_NilFrom(t *testing.T) {
+	tb := newTestBot(t)
+
+	// Message present but From nil — channel/service posts have no author.
+	// The dispatcher must drop these before they hit the admin-map lookup
+	// (which would nil-deref on msg.From.ID otherwise).
 	tb.bot.handleUpdate(context.Background(), tgbotapi.Update{
 		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 1}, Text: "hello"},
 	})
 
 	if len(tb.api.sent) != 0 {
-		t.Errorf("api.Send called %d times, want 0 (nil-guard skipped)", len(tb.api.sent))
+		t.Errorf("api.Send called %d times, want 0 (nil From must be dropped)", len(tb.api.sent))
+	}
+}
+
+func TestHandleUpdate_NilChat(t *testing.T) {
+	tb := newTestBot(t)
+
+	// Message and From present, Chat nil — every handler dereferences msg.Chat.ID
+	// to build the reply, so reaching a handler with nil Chat would panic and
+	// tear down the Run loop. The dispatcher must filter this before dispatch.
+	tb.bot.handleUpdate(context.Background(), tgbotapi.Update{
+		Message: &tgbotapi.Message{From: &tgbotapi.User{ID: tb.adminTG}, Text: "hello"},
+	})
+
+	if len(tb.api.sent) != 0 {
+		t.Errorf("api.Send called %d times, want 0 (nil Chat must be dropped)", len(tb.api.sent))
 	}
 }
 
@@ -1130,9 +1536,9 @@ func TestRun_HandlesUpdate(t *testing.T) {
 	tb := newTestBot(t)
 
 	// pre-load one update into a buffered channel and close it; Run will
-	// drain the seeded update, observe the closed channel, and return.
-	// Using close-then-read instead of timing a sleep keeps the test
-	// deterministic — no goroutine race between the send and the
+	// drain the seeded update, observe the closed channel while ctx is
+	// still live, and return ErrUpdatesClosed. Close-then-read keeps the
+	// test deterministic — no goroutine race between the send and the
 	// ctx-cancel path.
 	ch := make(chan tgbotapi.Update, 1)
 	ch <- tgbotapi.Update{
@@ -1145,8 +1551,9 @@ func TestRun_HandlesUpdate(t *testing.T) {
 	close(ch)
 	tb.api.updates = ch
 
-	if err := tb.bot.Run(context.Background()); err != nil {
-		t.Fatalf("Run: %v", err)
+	err := tb.bot.Run(context.Background())
+	if !errors.Is(err, ErrUpdatesClosed) {
+		t.Fatalf("Run returned %v, want ErrUpdatesClosed", err)
 	}
 
 	if len(tb.api.sent) != 1 {
@@ -1161,6 +1568,26 @@ func TestRun_HandlesUpdate(t *testing.T) {
 	}
 	if !tb.api.stopCalled {
 		t.Error("Run returned without invoking StopReceivingUpdates (would leak the upstream poll goroutine)")
+	}
+}
+
+func TestRun_ChannelClosedSurfacedAsError(t *testing.T) {
+	tb := newTestBot(t)
+
+	// No updates, channel closed immediately: simulates the upstream poll
+	// goroutine exiting for a reason other than ctx cancellation. Run must
+	// surface ErrUpdatesClosed so cmd/bot/main.go logs a real failure
+	// rather than exiting 0 silently.
+	ch := make(chan tgbotapi.Update)
+	close(ch)
+	tb.api.updates = ch
+
+	err := tb.bot.Run(context.Background())
+	if !errors.Is(err, ErrUpdatesClosed) {
+		t.Fatalf("Run returned %v, want ErrUpdatesClosed", err)
+	}
+	if !tb.api.stopCalled {
+		t.Error("Run returned without invoking StopReceivingUpdates")
 	}
 }
 
@@ -1185,5 +1612,177 @@ func TestRun_ContextCancel(t *testing.T) {
 	}
 	if len(tb.api.sent) != 0 {
 		t.Errorf("api.Send called %d times despite no updates, want 0", len(tb.api.sent))
+	}
+}
+
+// urlErrorWithSecret builds a *url.Error whose Error() formats as
+// `<Op> "<URL>": <Err>` — exactly the shape the tgbotapi library surfaces when
+// its underlying http.Client.Do fails. Used by the redaction regression tests
+// to seed a fake Telegram API with an error that leaks a bot-token-bearing
+// URL unless the logging call site strips it first.
+func urlErrorWithSecret(op, secretURL string) error {
+	return &url.Error{Op: op, URL: secretURL, Err: errors.New("transport failure")}
+}
+
+// The next three tests guard against bot-token leakage via slog error
+// attributes. tgbotapi's MakeRequest constructs the request URL as
+// `fmt.Sprintf(apiEndpoint, Token, endpoint)` and returns the raw *url.Error
+// from http.Client.Do on transport failure — url.Error.Error() formats as
+// `<Op> "<URL>": <Err>`, so any unredacted log of that error would dump the
+// bot token into operator-visible logs on every transient network hiccup.
+
+func TestHandleUpdate_SendErrorRedactsToken(t *testing.T) {
+	tb := newTestBot(t)
+	const secretURL = "https://api.telegram.org/bot12345:SUPERSECRET/sendMessage"
+	tb.api.sendErr = urlErrorWithSecret("Post", secretURL)
+
+	var buf bytes.Buffer
+	tb.bot.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	update := tgbotapi.Update{
+		Message: &tgbotapi.Message{
+			Chat: &tgbotapi.Chat{ID: 42},
+			From: &tgbotapi.User{ID: tb.adminTG},
+			Text: "hello",
+		},
+	}
+	tb.bot.handleUpdate(context.Background(), update)
+
+	logged := buf.String()
+	if !strings.Contains(logged, "send reply") {
+		t.Fatalf("expected send-reply error log, got %q", logged)
+	}
+	if strings.Contains(logged, "SUPERSECRET") {
+		t.Errorf("send-reply log leaks bot token: %q", logged)
+	}
+	if strings.Contains(logged, "api.telegram.org") {
+		t.Errorf("send-reply log leaks URL host: %q", logged)
+	}
+}
+
+func TestHandleDocument_GetFileURLErrorRedactsToken(t *testing.T) {
+	tb := newTestBot(t)
+	const secretURL = "https://api.telegram.org/bot12345:SUPERSECRET/getFile"
+	tb.api.fileURLErr = urlErrorWithSecret("Post", secretURL)
+
+	var buf bytes.Buffer
+	tb.bot.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	doc := &tgbotapi.Document{
+		FileID:   "doc_err",
+		FileName: "report.txt",
+		FileSize: 1024,
+	}
+	_, err := tb.bot.handleDocument(context.Background(), newDocumentMessage(tb, 42, doc))
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "get file direct url") {
+		t.Fatalf("expected get-file-direct-url error log, got %q", logged)
+	}
+	if strings.Contains(logged, "SUPERSECRET") {
+		t.Errorf("get-file-direct-url log leaks bot token: %q", logged)
+	}
+	if strings.Contains(logged, "api.telegram.org") {
+		t.Errorf("get-file-direct-url log leaks URL host: %q", logged)
+	}
+}
+
+func TestHandlePhoto_GetFileURLErrorRedactsToken(t *testing.T) {
+	tb := newTestBot(t)
+	const secretURL = "https://api.telegram.org/bot12345:SUPERSECRET/getFile"
+	tb.api.fileURLErr = urlErrorWithSecret("Post", secretURL)
+
+	var buf bytes.Buffer
+	tb.bot.logger = slog.New(slog.NewTextHandler(&buf, nil))
+
+	photos := []tgbotapi.PhotoSize{{
+		FileID:       "photo_err",
+		FileUniqueID: "unique_err",
+		FileSize:     1024,
+	}}
+	_, err := tb.bot.handlePhoto(context.Background(), newPhotoMessage(tb, 42, photos))
+	if err != nil {
+		t.Fatalf("handlePhoto: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "get file direct url") {
+		t.Fatalf("expected get-file-direct-url error log, got %q", logged)
+	}
+	if strings.Contains(logged, "SUPERSECRET") {
+		t.Errorf("get-file-direct-url log leaks bot token: %q", logged)
+	}
+	if strings.Contains(logged, "api.telegram.org") {
+		t.Errorf("get-file-direct-url log leaks URL host: %q", logged)
+	}
+}
+
+// TestTgLoggerRedactsToken locks in the redaction wrapper that bot.New
+// installs as tgbotapi's package-level logger. The upstream GetUpdatesChan
+// retry loop logs `<Op> "<URL>": <Err>` on every transient transport failure
+// — without this wrapper the long-poll URL (bot token included) goes straight
+// to stderr. Both Println (used for log.Println(err)) and Printf (used for
+// the debug-log endpoint dumps) must redact.
+func TestTgLoggerRedactsToken(t *testing.T) {
+	const secretURL = "https://api.telegram.org/bot12345:SUPERSECRET/getUpdates"
+	urlErr := urlErrorWithSecret("Get", secretURL)
+
+	cases := []struct {
+		name string
+		emit func(*tgLogger)
+	}{
+		{
+			name: "Println error",
+			emit: func(l *tgLogger) { l.Println(urlErr) },
+		},
+		{
+			name: "Println string",
+			emit: func(l *tgLogger) {
+				l.Println(`Get "` + secretURL + `": connection refused`)
+			},
+		},
+		{
+			name: "Printf",
+			emit: func(l *tgLogger) {
+				l.Printf("Endpoint: %s", secretURL)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tc.emit(&tgLogger{log: slog.New(slog.NewTextHandler(&buf, nil))})
+
+			logged := buf.String()
+			if strings.Contains(logged, "SUPERSECRET") {
+				t.Errorf("tgLogger leaked bot token: %q", logged)
+			}
+			if !strings.Contains(logged, "bot[REDACTED]") {
+				t.Errorf("tgLogger missing redaction marker: %q", logged)
+			}
+		})
+	}
+}
+
+// TestBuildShareReply_TrimsBaseURLTrailingSlash locks in the buildShareReply
+// normalisation: an operator-configured BASE_URL with a trailing slash must
+// not produce double-slashed share URLs. config.validateURL accepts the
+// trailing form, so the fix belongs at the reply-formatting site.
+func TestBuildShareReply_TrimsBaseURLTrailingSlash(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example/"
+
+	sh := &share.Share{ID: "abc12345"}
+	reply := tb.bot.buildShareReply(42, share.KindText, "", 0, sh)
+
+	if strings.Contains(reply.Text, "//abc12345") {
+		t.Errorf("reply.Text should not contain double slash before share id; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/abc12345") {
+		t.Errorf("reply.Text missing normalised URL; got %q", reply.Text)
 	}
 }
