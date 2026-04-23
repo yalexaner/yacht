@@ -158,10 +158,19 @@ func newShareID() (string, error) {
 // see s.storage.Put overwrite the existing share's bytes before the INSERT
 // failed on PRIMARY KEY, leaving the original share permanently pointing at
 // the wrong payload. The check races with concurrent CreateShare calls
-// (TOCTOU between this SELECT and the eventual INSERT), but at personal scale
-// a sub-microsecond collision window between two concurrent creations is not
-// a realistic failure mode. The retry cap exists only as defense against an
-// otherwise infinite loop if the table somehow filled the keyspace.
+// (TOCTOU between this SELECT and the eventual INSERT that spans the upload
+// — seconds to minutes, not microseconds), and a second caller picking the
+// same ID inside that window plus the insert-failure cleanup at the end of
+// CreateFileShare could delete the winner's object. At personal scale the
+// realistic bound is a single uploader at a time, and even with concurrent
+// uploads 47 bits of per-ID entropy makes independently picking the same
+// nanoid effectively never happen — the failure mode is acknowledged rather
+// than engineered away. A stronger fix (reserve the ID via an INSERT
+// placeholder before upload) is deferred: it would turn every upload failure
+// into a DB-orphan row that OpenContent surfaces as storage.ErrNotFound,
+// which is a worse user-visible failure mode than the collision it prevents.
+// The retry cap exists only as defense against an otherwise infinite loop
+// if the table somehow filled the keyspace.
 func (s *Service) allocateShareID(ctx context.Context) (string, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		id, err := newShareID()

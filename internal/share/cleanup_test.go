@@ -41,23 +41,6 @@ func TestCleanup_EmptyTables(t *testing.T) {
 	}
 }
 
-// TestCleanupStats_String locks the compact one-liner format so future edits
-// don't silently change what ad-hoc debugging output or log messages look
-// like. The cmd/web ticker uses structured slog attrs rather than this
-// helper, but the helper is part of the package surface.
-func TestCleanupStats_String(t *testing.T) {
-	got := CleanupStats{
-		SharesDeleted:      2,
-		SessionsDeleted:    3,
-		LoginTokensDeleted: 4,
-		Errors:             1,
-	}.String()
-	want := "shares=2 sessions=3 login_tokens=4 errors=1"
-	if got != want {
-		t.Errorf("String() = %q, want %q", got, want)
-	}
-}
-
 // expireShare rewrites the expires_at column on an existing row to a time
 // in the past. Tests use this rather than sleeping for a real expiry or
 // shrinking DefaultExpiry so the "share is expired" state is produced
@@ -175,7 +158,7 @@ func TestCleanup_ExpiredTextShare(t *testing.T) {
 	if err != nil {
 		t.Fatalf("local.New: %v", err)
 	}
-	rec := &recordingDeleteStorage{inner: inner}
+	rec := &fakeStorage{inner: inner}
 	svc, handle := newServiceWithStorage(t, rec)
 	userID := insertTestUser(t, handle)
 
@@ -260,7 +243,7 @@ func TestCleanup_StorageErrorSkipsDBDelete(t *testing.T) {
 		t.Fatalf("local.New: %v", err)
 	}
 	stubErr := errors.New("simulated storage delete failure")
-	backend := &deleteFailingStorage{inner: inner, deleteErr: stubErr}
+	backend := &fakeStorage{inner: inner, deleteErr: stubErr}
 	svc, handle := newServiceWithStorage(t, backend)
 	userID := insertTestUser(t, handle)
 
@@ -318,7 +301,7 @@ func TestCleanup_StorageErrNotFoundProceedsWithDBDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("local.New: %v", err)
 	}
-	backend := &deleteFailingStorage{inner: inner, deleteErr: storage.ErrNotFound}
+	backend := &fakeStorage{inner: inner, deleteErr: storage.ErrNotFound}
 	svc, handle := newServiceWithStorage(t, backend)
 	userID := insertTestUser(t, handle)
 
@@ -353,6 +336,62 @@ func TestCleanup_StorageErrNotFoundProceedsWithDBDelete(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("shares row count for %q = %d, want 0 (DB delete must run)", created.ID, count)
+	}
+}
+
+// TestCleanup_DBDeleteErrorAfterStorageDelete covers the rarest path in
+// cleanupExpiredShares: storage.Delete succeeds, then the DB DELETE on
+// that row fails. Regressions here are invisible because the storage
+// object is already gone — only the stats.Errors bump and the surviving
+// DB row prove the failure path wired correctly. We force the failure via
+// a BEFORE DELETE trigger that RAISE(FAIL)s every delete on shares. The
+// real storage.Delete runs first against the unwrapped local backend, so
+// this test verifies the stats/row-survives contract but does not itself
+// instrument the storage-first ordering — that's locked in by
+// TestCleanup_StorageErrorSkipsDBDelete and TestCleanup_ExpiredFileShare.
+func TestCleanup_DBDeleteErrorAfterStorageDelete(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "poisoned.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+	expireShare(t, handle, created.ID)
+
+	if _, err := handle.ExecContext(context.Background(),
+		`CREATE TRIGGER block_shares_delete BEFORE DELETE ON shares
+		 BEGIN SELECT RAISE(FAIL, 'blocked'); END`); err != nil {
+		t.Fatalf("install trigger: %v", err)
+	}
+
+	stats, err := svc.Cleanup(context.Background())
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if stats.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", stats.Errors)
+	}
+	if stats.SharesDeleted != 0 {
+		t.Errorf("SharesDeleted = %d, want 0 (DB delete failed)", stats.SharesDeleted)
+	}
+
+	// row must survive for the next cycle to retry. Without this assertion,
+	// a bug that bumps SharesDeleted anyway would go unnoticed.
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM shares WHERE id = ?`, created.ID).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("shares row count for %q = %d, want 1 (row must survive for retry)", created.ID, count)
 	}
 }
 
@@ -543,46 +582,108 @@ func TestCleanup_CancelledContextReturnsPromptly(t *testing.T) {
 	}
 }
 
-// recordingDeleteStorage wraps a real backend so tests can assert whether
-// Delete was invoked (and with which keys). Put and Get are straight
-// passthroughs; only Delete is instrumented.
-type recordingDeleteStorage struct {
+// TestCleanup_MidLoopCancelAbortsPass locks in the stronger shutdown
+// contract: after the expired-shares SELECT has already populated its
+// buffered slice, a ctx cancel observed between rows MUST abort the pass
+// rather than plow through every remaining row bumping stats.Errors on
+// each ctx-cancelled storage/DB op. We set up two expired shares, wire
+// the fake storage to cancel the shared ctx on its first Delete, and
+// assert (a) Cleanup surfaces context.Canceled, (b) exactly one Delete
+// ran (the second row was skipped by the ctx.Err() guard), (c) no row
+// was counted as a per-row error.
+func TestCleanup_MidLoopCancelAbortsPass(t *testing.T) {
+	inner, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	backend := &cancellingStorage{inner: inner, cancel: cancel}
+	svc, handle := newServiceWithStorage(t, backend)
+	userID := insertTestUser(t, handle)
+
+	for i, name := range []string{"first.bin", "second.bin"} {
+		created, err := svc.CreateFileShare(context.Background(), CreateFileOpts{
+			UserID:           userID,
+			OriginalFilename: name,
+			MIMEType:         "application/octet-stream",
+			Size:             1,
+			Content:          bytes.NewReader([]byte{byte(i)}),
+		})
+		if err != nil {
+			t.Fatalf("CreateFileShare[%d]: %v", i, err)
+		}
+		expireShare(t, handle, created.ID)
+	}
+
+	stats, err := svc.Cleanup(ctx)
+	if err == nil {
+		t.Fatalf("Cleanup err = nil, want context.Canceled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false, err = %v", err)
+	}
+	if got := len(backend.deleted); got != 1 {
+		t.Errorf("storage.Delete invocations = %d, want 1 (second row must be skipped on ctx cancel)", got)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("stats.Errors = %d, want 0 (the aborted row must not be counted as a per-row error)", stats.Errors)
+	}
+}
+
+// cancellingStorage wraps a real backend and fires the provided cancel
+// on the first Delete call, then passes the call through. Used by
+// TestCleanup_MidLoopCancelAbortsPass to simulate shutdown arriving
+// mid-loop after at least one row has been processed.
+type cancellingStorage struct {
 	inner   storage.Storage
+	cancel  context.CancelFunc
 	deleted []string
 }
 
-func (r *recordingDeleteStorage) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
-	return r.inner.Put(ctx, key, body, size, contentType)
+func (c *cancellingStorage) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+	return c.inner.Put(ctx, key, body, size, contentType)
 }
 
-func (r *recordingDeleteStorage) Get(ctx context.Context, key string) (io.ReadCloser, *storage.ObjectInfo, error) {
-	return r.inner.Get(ctx, key)
+func (c *cancellingStorage) Get(ctx context.Context, key string) (io.ReadCloser, *storage.ObjectInfo, error) {
+	return c.inner.Get(ctx, key)
 }
 
-func (r *recordingDeleteStorage) Delete(ctx context.Context, key string) error {
-	r.deleted = append(r.deleted, key)
-	return r.inner.Delete(ctx, key)
+func (c *cancellingStorage) Delete(ctx context.Context, key string) error {
+	c.deleted = append(c.deleted, key)
+	if len(c.deleted) == 1 {
+		c.cancel()
+	}
+	return c.inner.Delete(ctx, key)
 }
 
-// deleteFailingStorage passes Put/Get through to an inner backend (so
-// CreateFileShare can succeed normally and the object lands on disk) but
-// intercepts Delete and returns a caller-supplied error. Tests use this
-// to simulate both transient storage failures (stubErr) and the
-// already-gone case (storage.ErrNotFound) without needing a mock that
-// lies about Put succeeding.
-type deleteFailingStorage struct {
+// fakeStorage wraps a real backend so tests can assert whether Delete was
+// invoked (via the deleted slice) and optionally force a caller-supplied
+// error instead of the real Delete. Put and Get always passthrough so
+// CreateFileShare lands a real object on disk. If deleteErr is nil,
+// Delete delegates to the inner backend; otherwise it records the key
+// and returns deleteErr without touching the backend — keeping the
+// object reachable so tests can assert "nothing got deleted on failure".
+type fakeStorage struct {
 	inner     storage.Storage
 	deleteErr error
+	deleted   []string
 }
 
-func (f *deleteFailingStorage) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
+func (f *fakeStorage) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
 	return f.inner.Put(ctx, key, body, size, contentType)
 }
 
-func (f *deleteFailingStorage) Get(ctx context.Context, key string) (io.ReadCloser, *storage.ObjectInfo, error) {
+func (f *fakeStorage) Get(ctx context.Context, key string) (io.ReadCloser, *storage.ObjectInfo, error) {
 	return f.inner.Get(ctx, key)
 }
 
-func (f *deleteFailingStorage) Delete(ctx context.Context, key string) error {
-	return f.deleteErr
+func (f *fakeStorage) Delete(ctx context.Context, key string) error {
+	f.deleted = append(f.deleted, key)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return f.inner.Delete(ctx, key)
 }

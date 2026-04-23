@@ -3,11 +3,7 @@ package share
 // Cleanup is the background GC pass for expired data. Designed to be called
 // on a ticker by the web binary (see SPEC § Background Workers). Per-cycle
 // scope: expired shares, expired sessions, used/expired login tokens.
-// Idempotent — safe to run mid-cycle, safe to run on a schema that's newly
-// populated. Subsequent tasks in Phase 8 flesh out each of the three
-// deletion paths; the initial shell simply establishes the method signature
-// and the CleanupStats return shape so callers (cmd/web's ticker goroutine)
-// can be wired up in parallel without waiting on the full implementation.
+// Idempotent — safe to interrupt mid-cycle, safe to run on an empty schema.
 
 import (
 	"context"
@@ -31,16 +27,6 @@ type CleanupStats struct {
 	SessionsDeleted    int64
 	LoginTokensDeleted int64
 	Errors             int64
-}
-
-// String returns a compact one-liner suitable for slog message bodies when
-// the caller prefers a single formatted field over four structured attrs.
-// cmd/web's ticker currently logs the structured attrs directly, so this
-// helper is optional — it exists so tests and ad-hoc debugging get a
-// human-readable form without re-deriving the format.
-func (c CleanupStats) String() string {
-	return fmt.Sprintf("shares=%d sessions=%d login_tokens=%d errors=%d",
-		c.SharesDeleted, c.SessionsDeleted, c.LoginTokensDeleted, c.Errors)
 }
 
 // Cleanup runs one GC pass across the three expiry-bearing tables and
@@ -90,26 +76,26 @@ func (s *Service) cleanupExpiredShares(ctx context.Context, stats *CleanupStats)
 	now := time.Now().Unix()
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, kind, storage_key FROM shares WHERE expires_at < ?`, now)
+		`SELECT id, storage_key FROM shares WHERE expires_at < ?`, now)
 	if err != nil {
 		return fmt.Errorf("cleanup: query expired shares: %w", err)
 	}
 	defer rows.Close()
 
-	// buffer the full result set before mutating the table. Holding a live
-	// *sql.Rows open across a DELETE on the same table produces undefined
-	// behavior on some SQLite configurations (database is locked / iterator
-	// invalidation); collecting first, then deleting, sidesteps the issue
-	// without needing a transaction.
+	// buffer the full result set before mutating the table. database/sql
+	// normally issues the DELETE on a separate pooled connection so an open
+	// SELECT cursor wouldn't block it, but collecting upfront keeps the
+	// loop independent of connection-pool internals (e.g. a future switch
+	// to a single-conn Tx for batching) and makes per-row error handling
+	// easier to reason about.
 	type expiredShare struct {
 		id         string
-		kind       string
 		storageKey sql.NullString
 	}
 	var expired []expiredShare
 	for rows.Next() {
 		var row expiredShare
-		if err := rows.Scan(&row.id, &row.kind, &row.storageKey); err != nil {
+		if err := rows.Scan(&row.id, &row.storageKey); err != nil {
 			return fmt.Errorf("cleanup: scan expired share: %w", err)
 		}
 		expired = append(expired, row)
@@ -117,14 +103,26 @@ func (s *Service) cleanupExpiredShares(ctx context.Context, stats *CleanupStats)
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("cleanup: iterate expired shares: %w", err)
 	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("cleanup: close expired shares rows: %w", err)
-	}
 
 	for _, row := range expired {
+		// abort the pass on ctx cancel rather than iterating the remaining
+		// rows and counting every ctx-cancelled storage/DB op as a row
+		// error. Without this check, a shutdown mid-cycle inflates
+		// stats.Errors by the row count and delays the goroutine exit by
+		// the time it takes to plow through the buffered slice.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("cleanup: expired shares: %w", err)
+		}
+
 		if row.storageKey.Valid {
 			err := s.storage.Delete(ctx, row.storageKey.String)
 			if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				// a ctx-cancel landing on this row mid-call is shutdown,
+				// not a row-level failure: short-circuit so stats.Errors
+				// isn't inflated for what is really the pass-fatal path.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return fmt.Errorf("cleanup: expired shares: %w", ctxErr)
+				}
 				// skip DB delete so the next cycle can retry. The row still
 				// points at its (possibly still-existing) object, which is
 				// the safe state to linger in; the R2 60-day lifecycle rule
@@ -136,6 +134,11 @@ func (s *Service) cleanupExpiredShares(ctx context.Context, stats *CleanupStats)
 
 		if _, err := s.db.ExecContext(ctx,
 			`DELETE FROM shares WHERE id = ?`, row.id); err != nil {
+			// same shutdown short-circuit as the storage.Delete branch: a
+			// ctx-cancelled DB op is the pass ending, not a row error.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("cleanup: expired shares: %w", ctxErr)
+			}
 			// the storage object is already gone (or never existed for a
 			// text share) — count the row as errored and move on. The next
 			// cycle will re-issue the storage.Delete, which is a no-op that

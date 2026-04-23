@@ -149,7 +149,7 @@
 
 ## Phase 8: Cleanup worker
 
-- [ ] `internal/share/cleanup.go` — `RunCleanup(ctx)` function:
+- [ ] `internal/share/cleanup.go` — `(*Service).Cleanup(ctx)` method:
   - [ ] Query expired shares
   - [ ] `storage.Delete` then `db.DeleteShare` for each
   - [ ] Clear expired sessions
