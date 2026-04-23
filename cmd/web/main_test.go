@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yalexaner/yacht/internal/db"
 )
 
 // validWebEnv mirrors the env map used in internal/config tests but lives
@@ -68,6 +70,32 @@ func TestRun_HappyPath(t *testing.T) {
 	// silently no-oped, both of which are bugs in the startup path.
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Errorf("expected db file at %q after run, got stat err: %v", dbPath, err)
+	}
+	assertMigrated(t, dbPath)
+}
+
+// assertMigrated reopens the DB at dbPath and fails the test if
+// schema_migrations has zero rows. Proves that run() called db.Migrate,
+// not just db.New — os.Stat alone can't distinguish the two.
+func assertMigrated(t *testing.T, dbPath string) {
+	t.Helper()
+	ctx := context.Background()
+	h, err := db.New(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	defer func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	var n int
+	if err := h.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
+		t.Fatalf("count schema_migrations: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("schema_migrations has 0 rows; db.Migrate did not run")
 	}
 }
 
