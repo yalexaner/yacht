@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -70,6 +71,26 @@ func expireShare(t *testing.T, handle *sql.DB, id string) {
 		`UPDATE shares SET expires_at = ? WHERE id = ?`, past, id); err != nil {
 		t.Fatalf("expireShare(%q): %v", id, err)
 	}
+}
+
+// insertSessionRow inserts a row directly into the sessions table with the
+// given expires_at offset (seconds relative to now; negative = expired).
+// Sessions aren't produced by any code path until Phase 9 adds the auth
+// layer, so cleanup tests build the fixture by raw insert rather than via
+// a public constructor. Returns the generated session id so tests can
+// assert row presence/absence afterwards.
+func insertSessionRow(t *testing.T, handle *sql.DB, userID int64, expiresAtOffset time.Duration) string {
+	t.Helper()
+
+	now := time.Now()
+	id := fmt.Sprintf("sess-%d", now.UnixNano())
+	if _, err := handle.ExecContext(context.Background(),
+		`INSERT INTO sessions (id, user_id, provider, expires_at, created_at)
+		 VALUES (?, ?, 'telegram_widget', ?, ?)`,
+		id, userID, now.Add(expiresAtOffset).Unix(), now.Unix()); err != nil {
+		t.Fatalf("insertSessionRow: %v", err)
+	}
+	return id
 }
 
 // TestCleanup_ExpiredFileShare covers the storage-then-DB delete path for
@@ -306,6 +327,67 @@ func TestCleanup_StorageErrNotFoundProceedsWithDBDelete(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("shares row count for %q = %d, want 0 (DB delete must run)", created.ID, count)
+	}
+}
+
+// TestCleanup_ExpiredSession covers the happy path for session GC: a row
+// whose expires_at has already passed is removed and the deletion shows
+// up in stats.SessionsDeleted. Uses insertSessionRow because the Phase 9
+// auth layer that produces sessions doesn't exist yet.
+func TestCleanup_ExpiredSession(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+	id := insertSessionRow(t, handle, userID, -1*time.Hour)
+
+	stats, err := svc.Cleanup(context.Background())
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if stats.SessionsDeleted != 1 {
+		t.Errorf("SessionsDeleted = %d, want 1", stats.SessionsDeleted)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM sessions WHERE id = ?`, id).Scan(&count); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("sessions row count for %q = %d, want 0", id, count)
+	}
+}
+
+// TestCleanup_ActiveSessionUntouched confirms the expires_at < now filter
+// is exclusive: a session whose expiry sits in the future survives the
+// pass with the row intact and stats.SessionsDeleted unchanged.
+func TestCleanup_ActiveSessionUntouched(t *testing.T) {
+	svc, handle := newTestService(t)
+	userID := insertTestUser(t, handle)
+	id := insertSessionRow(t, handle, userID, 1*time.Hour)
+
+	stats, err := svc.Cleanup(context.Background())
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	if stats.SessionsDeleted != 0 {
+		t.Errorf("SessionsDeleted = %d, want 0", stats.SessionsDeleted)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM sessions WHERE id = ?`, id).Scan(&count); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("sessions row count for %q = %d, want 1", id, count)
 	}
 }
 

@@ -49,12 +49,16 @@ func (c CleanupStats) String() string {
 // through to every DB and storage call so the pass exits promptly when the
 // web binary receives SIGINT/SIGTERM mid-cycle.
 //
-// Tasks 3–4 will layer expired-sessions and used/expired login-token
-// deletes on top of the expired-shares pass implemented here.
+// Task 4 will layer used/expired login-token deletes on top of the
+// expired-shares and expired-sessions passes implemented here.
 func (s *Service) Cleanup(ctx context.Context) (CleanupStats, error) {
 	var stats CleanupStats
 
 	if err := s.cleanupExpiredShares(ctx, &stats); err != nil {
+		return stats, err
+	}
+
+	if err := s.cleanupExpiredSessions(ctx, &stats); err != nil {
 		return stats, err
 	}
 
@@ -141,5 +145,28 @@ func (s *Service) cleanupExpiredShares(ctx context.Context, stats *CleanupStats)
 		stats.SharesDeleted++
 	}
 
+	return nil
+}
+
+// cleanupExpiredSessions deletes every row in sessions whose expires_at is
+// in the past. Sessions carry no external-resource side effects — the row
+// IS the session — so a single DELETE statement is both necessary and
+// sufficient. RowsAffected feeds stats.SessionsDeleted so callers see how
+// much reclaimed space this pass produced even though there's no per-row
+// work to narrate. A non-nil error is returned so the caller can log and
+// the ticker retries next tick; there's no per-row error path because
+// there's no per-row work.
+func (s *Service) cleanupExpiredSessions(ctx context.Context, stats *CleanupStats) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM sessions WHERE expires_at < ?`, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("cleanup: delete expired sessions: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("cleanup: expired sessions rows affected: %w", err)
+	}
+	stats.SessionsDeleted = n
 	return nil
 }
