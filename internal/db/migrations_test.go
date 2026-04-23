@@ -31,10 +31,10 @@ func openTestDB(t *testing.T) *sql.DB {
 
 // countSchemaMigrations returns the number of rows in schema_migrations.
 // Used by idempotency checks and as a sanity probe after rollback tests.
-func countSchemaMigrations(t *testing.T, db *sql.DB) int {
+func countSchemaMigrations(t *testing.T, ctx context.Context, db *sql.DB) int {
 	t.Helper()
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
 	return n
@@ -74,7 +74,7 @@ func TestMigrate_AppliesAll(t *testing.T) {
 	if applied != want {
 		t.Errorf("Migrate returned applied=%d, want %d", applied, want)
 	}
-	got := countSchemaMigrations(t, db)
+	got := countSchemaMigrations(t, ctx, db)
 	if got != want {
 		t.Fatalf("schema_migrations rows = %d, want %d (one per embedded file)", got, want)
 	}
@@ -111,7 +111,7 @@ func TestMigrate_Idempotent(t *testing.T) {
 	if _, err := Migrate(ctx, db); err != nil {
 		t.Fatalf("Migrate (first): %v", err)
 	}
-	first := countSchemaMigrations(t, db)
+	first := countSchemaMigrations(t, ctx, db)
 
 	applied, err := Migrate(ctx, db)
 	if err != nil {
@@ -120,7 +120,7 @@ func TestMigrate_Idempotent(t *testing.T) {
 	if applied != 0 {
 		t.Errorf("second Migrate applied=%d, want 0 (no-op)", applied)
 	}
-	second := countSchemaMigrations(t, db)
+	second := countSchemaMigrations(t, ctx, db)
 
 	if first != second {
 		t.Errorf("row count changed across re-run: first=%d, second=%d", first, second)
@@ -188,7 +188,7 @@ func TestMigrate_ConcurrentSafe(t *testing.T) {
 	if totalApplied != want {
 		t.Errorf("sum of applied counts = %d, want %d (each migration applied by exactly one runner)", totalApplied, want)
 	}
-	if got := countSchemaMigrations(t, first); got != want {
+	if got := countSchemaMigrations(t, ctx, first); got != want {
 		t.Errorf("schema_migrations rows = %d, want %d", got, want)
 	}
 }
@@ -208,7 +208,7 @@ func TestMigrateFS_EmptyIsNoOp(t *testing.T) {
 		t.Errorf("migrateFS on empty FS applied=%d, want 0", applied)
 	}
 
-	if n := countSchemaMigrations(t, db); n != 0 {
+	if n := countSchemaMigrations(t, ctx, db); n != 0 {
 		t.Errorf("schema_migrations rows = %d on empty FS, want 0", n)
 	}
 }
