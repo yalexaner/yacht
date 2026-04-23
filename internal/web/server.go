@@ -95,7 +95,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)
-	mux.HandleFunc("GET /d/{id}", s.notImplementedHandler)
+	mux.HandleFunc("GET /d/{id}", s.downloadHandler)
 
 	return mux
 }

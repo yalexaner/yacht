@@ -1,11 +1,16 @@
 package web
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/yalexaner/yacht/internal/share"
+	"github.com/yalexaner/yacht/internal/storage"
 )
 
 // shareCookieMaxAge bounds the lifetime of the per-share unlock cookie. Five
@@ -236,6 +241,198 @@ func (s *Server) hasShareCookie(r *http.Request, shareID string) bool {
 		return false
 	}
 	return c.Value == "1"
+}
+
+// downloadHandler serves GET /d/{id}: the actual download stream. It reuses
+// shareHandler's error mapping (404/410/500) and password-cookie gate, then
+// branches on Kind: file shares stream through storage with a UTF-8-aware
+// Content-Disposition; text shares serialize the stored text_content column
+// as a plain-text attachment named {shareID}.txt.
+//
+// A password-protected share reached without a valid unlock cookie renders
+// the password prompt at 401 rather than redirecting — the user came
+// straight to /d/, so a redirect would bounce them away from the URL they
+// clicked.
+//
+// IncrementDownloadCount runs after the response body starts streaming. We
+// use a detached context via context.WithoutCancel so the counter still
+// bumps when the client disconnects mid-stream — the byte it already
+// received is a completed download from our perspective, and the operator
+// metric is more useful when it tracks attempts, not just clean finishes.
+// A failure on the counter is logged and swallowed because the user's
+// download already succeeded; poisoning the response at this point would
+// only confuse them.
+func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		return
+	}
+
+	sh, err := s.share.Get(r.Context(), id)
+	if err != nil {
+		s.renderShareError(w, r, err)
+		return
+	}
+
+	if sh.PasswordHash != nil && !s.hasShareCookie(r, id) {
+		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{ID: id})
+		return
+	}
+
+	switch sh.Kind {
+	case share.KindFile:
+		s.streamFileShare(w, r, sh)
+	case share.KindText:
+		s.streamTextShare(w, r, sh)
+	default:
+		s.logger.Error("unknown share kind", "id", id, "kind", sh.Kind)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "We could not display this share.")
+	}
+}
+
+// streamFileShare pipes the storage-backed payload to the client with the
+// headers a browser needs to save it with the uploader's original filename.
+// Separated from downloadHandler so the password/kind branches stay
+// readable; no external caller reaches this method.
+func (s *Server) streamFileShare(w http.ResponseWriter, r *http.Request, sh *share.Share) {
+	body, err := s.share.OpenContent(r.Context(), sh)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			// db says the share exists, storage says the object doesn't — a
+			// drift state that warrants an operator alert, but to the user
+			// looks indistinguishable from any other internal failure.
+			s.logger.Warn("storage object missing for share", "id", sh.ID, "err", err)
+			s.renderError(w, http.StatusInternalServerError, "Something went wrong", "The backing data for this share is unavailable.")
+			return
+		}
+		s.logger.Error("open content failed", "id", sh.ID, "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+	defer body.Close()
+
+	filename := stringOrEmpty(sh.OriginalFilename)
+	mime := stringOrEmpty(sh.MIMEType)
+	size := int64OrZero(sh.SizeBytes)
+
+	if mime != "" {
+		w.Header().Set("Content-Type", mime)
+	}
+	if size > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	}
+	w.Header().Set("Content-Disposition", rfc5987ContentDisposition(filename))
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := io.Copy(w, body); err != nil {
+		// once headers are written the connection is already committed; all
+		// we can do is log the partial transfer for operator visibility.
+		s.logger.Warn("download stream interrupted", "id", sh.ID, "err", err)
+	}
+
+	s.bumpDownloadCount(r, sh.ID)
+}
+
+// streamTextShare serializes the stored text_content column as a plain-text
+// attachment. The filename is the share id with a .txt suffix — RFC 5987
+// isn't needed because share ids are ASCII-only by construction.
+func (s *Server) streamTextShare(w http.ResponseWriter, r *http.Request, sh *share.Share) {
+	content := stringOrEmpty(sh.TextContent)
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, sh.ID+".txt"))
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := io.WriteString(w, content); err != nil {
+		s.logger.Warn("text download stream interrupted", "id", sh.ID, "err", err)
+	}
+
+	s.bumpDownloadCount(r, sh.ID)
+}
+
+// bumpDownloadCount runs after the response body has started streaming.
+// Uses a detached context with a short timeout so a cancelled request ctx
+// (client disconnect, shutdown) doesn't suppress the counter update — the
+// download bytes have already left our process, so the download has
+// functionally happened regardless of whether the client stuck around to
+// read them. Errors are logged and swallowed because the response is
+// already committed and surfacing a counter failure would only mislead
+// the user.
+func (s *Server) bumpDownloadCount(r *http.Request, id string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	defer cancel()
+	if err := s.share.IncrementDownloadCount(ctx, id); err != nil {
+		s.logger.Warn("increment download count", "id", id, "err", err)
+	}
+}
+
+// rfc5987ContentDisposition builds the Content-Disposition header value for
+// an attachment with the supplied filename. The filename*=UTF-8'' form is
+// the canonical way to encode non-ASCII filenames per RFC 5987; we also
+// emit an ASCII-only fallback filename= for HTTP clients that ignore the
+// extended parameter. Non-ASCII bytes in the fallback are replaced with
+// underscores so the header stays valid under the stricter RFC 6266 token
+// rules.
+func rfc5987ContentDisposition(name string) string {
+	return fmt.Sprintf(`attachment; filename=%q; filename*=UTF-8''%s`, asciiFallbackName(name), rfc5987Encode(name))
+}
+
+// rfc5987Encode percent-encodes name per RFC 5987 §3.2.1: the "attr-char"
+// set (ALPHA / DIGIT / "!" / "#" / "$" / "&" / "+" / "-" / "." / "^" / "_"
+// / "`" / "|" / "~") passes through; everything else — including space and
+// every non-ASCII byte — is written as %HH over the UTF-8 byte sequence.
+func rfc5987Encode(name string) string {
+	var out []byte
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if isAttrChar(b) {
+			out = append(out, b)
+			continue
+		}
+		out = append(out, '%')
+		const hex = "0123456789ABCDEF"
+		out = append(out, hex[b>>4], hex[b&0x0F])
+	}
+	return string(out)
+}
+
+// asciiFallbackName returns a filename safe to place inside the quoted
+// filename= parameter: non-ASCII bytes and the two quoted-string specials
+// (`"` and `\`) collapse to underscores so the header stays RFC 6266
+// compliant when a client ignores the filename* extension.
+func asciiFallbackName(name string) string {
+	out := make([]byte, 0, len(name))
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b < 0x20 || b >= 0x7f || b == '"' || b == '\\' {
+			out = append(out, '_')
+			continue
+		}
+		out = append(out, b)
+	}
+	if len(out) == 0 {
+		return "download"
+	}
+	return string(out)
+}
+
+// isAttrChar reports whether b is in the RFC 5987 attr-char set.
+func isAttrChar(b byte) bool {
+	switch {
+	case b >= 'A' && b <= 'Z':
+		return true
+	case b >= 'a' && b <= 'z':
+		return true
+	case b >= '0' && b <= '9':
+		return true
+	}
+	switch b {
+	case '!', '#', '$', '&', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
 }
 
 // stringOrEmpty dereferences a *string and returns "" when nil. Used to

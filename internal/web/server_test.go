@@ -553,6 +553,288 @@ func TestPassword_ShareWithoutPassword(t *testing.T) {
 	}
 }
 
+// TestDownload_File: a plain file share streams its bytes with the
+// Content-Type and Content-Length from the row and an RFC-6266-compliant
+// Content-Disposition that exposes the uploader's original filename. The
+// download_count column goes from 0 to 1 after the handler returns, proving
+// the post-stream IncrementDownloadCount ran on the detached ctx.
+func TestDownload_File(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	payload := []byte("hello world")
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "greeting.txt",
+		MIMEType:         "text/plain",
+		Size:             int64(len(payload)),
+		Content:          bytes.NewReader(payload),
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/d/"+created.ID, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain" {
+		t.Errorf("content-type: want %q, got %q", "text/plain", ct)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != "11" {
+		t.Errorf("content-length: want %q, got %q", "11", cl)
+	}
+	cd := rec.Header().Get("Content-Disposition")
+	for _, want := range []string{
+		`attachment;`,
+		`filename="greeting.txt"`,
+		`filename*=UTF-8''greeting.txt`,
+	} {
+		if !strings.Contains(cd, want) {
+			t.Errorf("content-disposition missing %q; got %q", want, cd)
+		}
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, payload) {
+		t.Errorf("body: want %q, got %q", payload, got)
+	}
+
+	// confirm IncrementDownloadCount ran via the detached ctx.
+	after, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get after download: %v", err)
+	}
+	if after.DownloadCount != 1 {
+		t.Errorf("download_count: want 1, got %d", after.DownloadCount)
+	}
+}
+
+// TestDownload_Text: a text share is served as a text/plain attachment named
+// {shareID}.txt. The body is the stored text content verbatim — no HTML
+// wrapping, no template. download_count moves from 0 to 1 the same way.
+func TestDownload_Text(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	content := "a secret memo"
+	created, err := svc.CreateTextShare(context.Background(), share.CreateTextOpts{
+		UserID:  userID,
+		Content: content,
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/d/"+created.ID, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("content-type: want %q, got %q", "text/plain; charset=utf-8", ct)
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != "13" {
+		t.Errorf("content-length: want %q, got %q", "13", cl)
+	}
+	wantCD := `attachment; filename="` + created.ID + `.txt"`
+	if cd := rec.Header().Get("Content-Disposition"); cd != wantCD {
+		t.Errorf("content-disposition: want %q, got %q", wantCD, cd)
+	}
+	if got := rec.Body.String(); got != content {
+		t.Errorf("body: want %q, got %q", content, got)
+	}
+
+	after, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get after download: %v", err)
+	}
+	if after.DownloadCount != 1 {
+		t.Errorf("download_count: want 1, got %d", after.DownloadCount)
+	}
+}
+
+// TestDownload_UTF8Filename: a file whose original filename carries non-ASCII
+// bytes must be exposed via the RFC 5987 filename*= form with correct
+// percent-encoding of the UTF-8 bytes. The ASCII filename= fallback is
+// underscored — browsers that understand filename*= ignore it, but it must
+// still be a valid quoted-string per RFC 6266.
+func TestDownload_UTF8Filename(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	payload := []byte("hi")
+	name := "привет.pdf"
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: name,
+		MIMEType:         "application/pdf",
+		Size:             int64(len(payload)),
+		Content:          bytes.NewReader(payload),
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/d/"+created.ID, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	cd := rec.Header().Get("Content-Disposition")
+	// "привет.pdf" UTF-8 bytes: D0 BF D1 80 D0 B8 D0 B2 D0 B5 D1 82 2E 70 64 66
+	wantExt := "filename*=UTF-8''%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82.pdf"
+	if !strings.Contains(cd, wantExt) {
+		t.Errorf("content-disposition missing %q; got %q", wantExt, cd)
+	}
+	// ASCII fallback must exist and not contain the raw non-ASCII bytes.
+	if !strings.Contains(cd, `filename="`) {
+		t.Errorf("content-disposition missing quoted filename= fallback; got %q", cd)
+	}
+	for _, b := range []byte(name) {
+		if b >= 0x80 {
+			if strings.IndexByte(cd, b) >= 0 {
+				t.Errorf("content-disposition fallback leaks non-ASCII byte 0x%02x; got %q", b, cd)
+				break
+			}
+		}
+	}
+}
+
+// TestDownload_Missing: GET /d/{id} for a nonexistent share returns 404 via
+// the same error mapping as the share page. The user should not be able to
+// tell from the status whether the id ever existed.
+func TestDownload_Missing(t *testing.T) {
+	srv, _, _ := newTestServerWithShare(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/d/nosuchid", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status: want 404, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Not Found") {
+		t.Errorf("body missing 'Not Found'; got:\n%s", rec.Body.String())
+	}
+}
+
+// TestDownload_Expired: an existing row whose expires_at has passed surfaces
+// as 410 Gone on the download endpoint just like on the share page — a
+// lapsed URL should never start streaming bytes.
+func TestDownload_Expired(t *testing.T) {
+	srv, _, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	pastExpires := time.Now().Add(-1 * time.Hour).Unix()
+	createdAt := time.Now().Add(-2 * time.Hour).Unix()
+	id := "expireddl"
+	_, err := handle.ExecContext(context.Background(), `
+		INSERT INTO shares
+			(id, user_id, kind, text_content, created_at, expires_at, download_count)
+		VALUES (?, ?, 'text', 'stale', ?, ?, 0)
+	`, id, userID, createdAt, pastExpires)
+	if err != nil {
+		t.Fatalf("insert expired row: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/d/"+id, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status: want 410, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestDownload_WithPasswordNoCookie: a password-protected share hit without
+// an unlock cookie must render the password prompt at 401 rather than
+// streaming bytes. Redirecting is wrong here — the user is already on the
+// /d/ URL and we'd bounce them away from the link they clicked.
+func TestDownload_WithPasswordNoCookie(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             3,
+		Content:          bytes.NewReader([]byte{1, 2, 3}),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/d/"+created.ID, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status: want 401, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Password required",
+		`type="password"`,
+		`name="password"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q; got:\n%s", want, body)
+		}
+	}
+	after, err := svc.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get after blocked download: %v", err)
+	}
+	if after.DownloadCount != 0 {
+		t.Errorf("download_count: want 0 (prompt, no stream), got %d", after.DownloadCount)
+	}
+}
+
+// TestDownload_WithPasswordValidCookie: the same protected share, but the
+// request carries the unlock cookie set by a successful POST. The server
+// must honour it and stream the bytes instead of re-prompting.
+func TestDownload_WithPasswordValidCookie(t *testing.T) {
+	srv, svc, handle := newTestServerWithShare(t)
+	userID := insertWebTestUser(t, handle)
+
+	payload := []byte{1, 2, 3}
+	created, err := svc.CreateFileShare(context.Background(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: "secret.bin",
+		MIMEType:         "application/octet-stream",
+		Size:             int64(len(payload)),
+		Content:          bytes.NewReader(payload),
+		Password:         "hunter2",
+	})
+	if err != nil {
+		t.Fatalf("CreateFileShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/d/"+created.ID, nil)
+	req.AddCookie(&http.Cookie{Name: "yacht_share_" + created.ID, Value: "1"})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, payload) {
+		t.Errorf("body: want %v, got %v", payload, got)
+	}
+	cd := rec.Header().Get("Content-Disposition")
+	if !strings.Contains(cd, `filename="secret.bin"`) {
+		t.Errorf("content-disposition: missing quoted filename; got %q", cd)
+	}
+}
+
 // TestShare_Expired: a row that exists but whose expires_at is in the past
 // must surface as 410 Gone — not 404. The distinction matters because a
 // user following a known-good URL that has since expired needs a different
