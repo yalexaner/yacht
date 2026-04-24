@@ -11,6 +11,7 @@
 package web
 
 import (
+	"database/sql"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/share"
 	webassets "github.com/yalexaner/yacht/web"
@@ -32,11 +34,14 @@ import (
 // the same package reach in directly, and external callers have no business
 // poking at the internals — the public surface is New + Routes.
 type Server struct {
-	cfg       *config.Web
-	share     *share.Service
-	templates map[string]*template.Template
-	static    fs.FS
-	logger    *slog.Logger
+	cfg          *config.Web
+	db           *sql.DB
+	share        *share.Service
+	authTelegram *auth.TelegramWidget
+	authBotToken *auth.BotToken
+	templates    map[string]*template.Template
+	static       fs.FS
+	logger       *slog.Logger
 }
 
 // New parses the embedded HTML templates, sub-roots the static FS to drop
@@ -51,7 +56,14 @@ type Server struct {
 // error rather than swallow it: a future refactor that drops one of those
 // directives would otherwise produce a confusing nil-FS panic deeper in
 // the request path.
-func New(cfg *config.Web, share *share.Service, logger *slog.Logger) (*Server, error) {
+func New(
+	cfg *config.Web,
+	db *sql.DB,
+	share *share.Service,
+	authTelegram *auth.TelegramWidget,
+	authBotToken *auth.BotToken,
+	logger *slog.Logger,
+) (*Server, error) {
 	tmplFS, err := fs.Sub(webassets.TemplatesFS, "templates")
 	if err != nil {
 		return nil, fmt.Errorf("web.New: templates sub fs: %w", err)
@@ -67,11 +79,14 @@ func New(cfg *config.Web, share *share.Service, logger *slog.Logger) (*Server, e
 	}
 
 	return &Server{
-		cfg:       cfg,
-		share:     share,
-		templates: tmpl,
-		static:    staticFS,
-		logger:    logger,
+		cfg:          cfg,
+		db:           db,
+		share:        share,
+		authTelegram: authTelegram,
+		authBotToken: authBotToken,
+		templates:    tmpl,
+		static:       staticFS,
+		logger:       logger,
 	}, nil
 }
 
@@ -95,6 +110,8 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.static))))
 
 	mux.HandleFunc("GET /login", s.loginHandler)
+	mux.HandleFunc("GET /auth/telegram/callback", s.telegramCallbackHandler)
+	mux.HandleFunc("GET /auth/{token}", s.botTokenHandler)
 
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)

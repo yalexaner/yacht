@@ -28,7 +28,7 @@ func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Web{Shared: &config.Shared{}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv, err := New(cfg, nil, logger)
+	srv, err := New(cfg, nil, nil, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -66,7 +66,7 @@ func newTestServerWithShare(t *testing.T) (*Server, *share.Service, *sql.DB) {
 
 	cfg := &config.Web{Shared: shared}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv, err := New(cfg, svc, logger)
+	srv, err := New(cfg, handle, svc, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1018,7 +1018,7 @@ func TestLogMiddleware_CapturesStatus(t *testing.T) {
 	var buf bytes.Buffer
 	cfg := &config.Web{Shared: &config.Shared{}}
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	srv, err := New(cfg, nil, logger)
+	srv, err := New(cfg, nil, nil, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

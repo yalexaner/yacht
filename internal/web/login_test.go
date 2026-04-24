@@ -22,7 +22,7 @@ func newLoginTestServer(t *testing.T) *Server {
 		TelegramBotUsername: "yachtshare_bot",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv, err := New(cfg, nil, logger)
+	srv, err := New(cfg, nil, nil, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

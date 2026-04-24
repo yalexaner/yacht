@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/share"
 	"github.com/yalexaner/yacht/internal/storage"
 )
@@ -103,6 +104,111 @@ func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 		BotUsername: s.cfg.TelegramBotUsername,
 		Error:       loginErrorMessages[r.URL.Query().Get("error")],
 	})
+}
+
+// telegramCallbackHandler serves GET /auth/telegram/callback: the endpoint
+// the Telegram Login Widget posts signed user fields to via browser GET when
+// configured with data-auth-url. Verify re-derives the HMAC and resolves the
+// embedded Telegram ID to an admin *User; the two expected failure modes
+// (ErrInvalidSignature, ErrUnauthorized) map to specific ?error= codes on the
+// login page so the user sees a meaningful message. Any other error is an
+// internal fault — log + generic 500.
+//
+// On success we mint a session, set the yacht_session cookie, and redirect
+// to "/" with 303 See Other (POST-redirect-GET semantics — even though this
+// is a GET, See Other is the idiomatic "auth completed, go home" code).
+func (s *Server) telegramCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	user, err := s.authTelegram.Verify(r)
+	switch {
+	case err == nil:
+		// fall through to session creation below.
+	case errors.Is(err, auth.ErrInvalidSignature):
+		http.Redirect(w, r, "/login?error=invalid_signature", http.StatusSeeOther)
+		return
+	case errors.Is(err, auth.ErrUnauthorized):
+		http.Redirect(w, r, "/login?error=access_denied", http.StatusSeeOther)
+		return
+	default:
+		s.logger.Error("telegram widget verify", "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+
+	sessionID, err := auth.CreateSession(r.Context(), s.db, user.ID, s.authTelegram.Name(), s.cfg.SessionLifetime)
+	if err != nil {
+		s.logger.Error("create session (telegram widget)", "user_id", user.ID, "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.cfg.SessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   int(s.cfg.SessionLifetime.Seconds()),
+		HttpOnly: true,
+		// SameSite=Lax (not Strict) because the login flow's redirect lands
+		// via Telegram's widget iframe — Strict would drop the cookie on
+		// top-level navigations initiated from another origin. Lax still
+		// blocks cross-site POSTs, which is what we care about for /logout.
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsTLS(r),
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// botTokenHandler serves GET /auth/{token}: the one-time login link the bot
+// DMs a user in response to /weblogin. ConsumeLoginToken atomically validates
+// the token and flips used_at on the row, so an immediate second click gets
+// ErrTokenUsed rather than re-authenticating. The four expected failure
+// modes each map to a distinct ?error= code on the login page — the user
+// needs a different message for "typo" vs "link expired" vs "already
+// clicked" vs "your account is not authorized".
+//
+// On success we mint a session tied to the bot_token provider, set the
+// yacht_session cookie (same attributes as the telegram widget path), and
+// redirect to "/" with 303 See Other.
+func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	user, err := s.authBotToken.ConsumeLoginToken(r.Context(), token)
+	switch {
+	case err == nil:
+		// fall through to session creation below.
+	case errors.Is(err, auth.ErrTokenNotFound):
+		http.Redirect(w, r, "/login?error=invalid_link", http.StatusSeeOther)
+		return
+	case errors.Is(err, auth.ErrTokenExpired):
+		http.Redirect(w, r, "/login?error=link_expired", http.StatusSeeOther)
+		return
+	case errors.Is(err, auth.ErrTokenUsed):
+		http.Redirect(w, r, "/login?error=link_used", http.StatusSeeOther)
+		return
+	case errors.Is(err, auth.ErrUnauthorized):
+		http.Redirect(w, r, "/login?error=access_denied", http.StatusSeeOther)
+		return
+	default:
+		s.logger.Error("bot token consume", "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+
+	sessionID, err := auth.CreateSession(r.Context(), s.db, user.ID, s.authBotToken.Name(), s.cfg.SessionLifetime)
+	if err != nil {
+		s.logger.Error("create session (bot token)", "user_id", user.ID, "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.cfg.SessionCookieName,
+		Value:    sessionID,
+		Path:     "/",
+		MaxAge:   int(s.cfg.SessionLifetime.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsTLS(r),
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 // healthzHandler is the liveness probe: no DB ping, no storage ping, just

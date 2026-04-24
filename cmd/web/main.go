@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
 	"github.com/yalexaner/yacht/internal/share"
@@ -100,7 +101,11 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	shareSvc := share.New(handle, store, cfg.Shared)
 
-	srv, err := web.New(cfg, shareSvc, logger)
+	authTelegram := auth.NewTelegramWidget(handle, cfg.TelegramBotToken)
+	authBotToken := auth.NewBotToken(handle)
+	logger.Info("auth ready", "providers", "telegram_widget,bot_token")
+
+	srv, err := web.New(cfg, handle, shareSvc, authTelegram, authBotToken, logger)
 	if err != nil {
 		return fmt.Errorf("init web: %w", err)
 	}
