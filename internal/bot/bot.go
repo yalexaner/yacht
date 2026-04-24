@@ -18,6 +18,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/share"
 )
@@ -83,7 +84,11 @@ type Bot struct {
 	// startup by bootstrapUsers from cfg.TelegramAdminIDs; read by the auth
 	// check and by handlers needing the FK-required users.id for new shares.
 	admins map[int64]int64
-	logger *slog.Logger
+	// authBotToken mints the one-time login tokens handed out by /weblogin.
+	// It is the bot-side entry point into the web-auth fallback flow, paired
+	// with the web handler that consumes them at GET /auth/{token}.
+	authBotToken *auth.BotToken
+	logger       *slog.Logger
 }
 
 // New constructs a Bot wired to real Telegram (and, when downloader is nil,
@@ -100,6 +105,7 @@ func New(
 	cfg *config.Bot,
 	db *sql.DB,
 	share *share.Service,
+	authBotToken *auth.BotToken,
 	downloader fileDownloader,
 	logger *slog.Logger,
 ) (*Bot, error) {
@@ -135,12 +141,13 @@ func New(
 	}
 
 	b := &Bot{
-		api:        api,
-		downloader: downloader,
-		share:      share,
-		cfg:        cfg,
-		admins:     admins,
-		logger:     logger,
+		api:          api,
+		downloader:   downloader,
+		share:        share,
+		cfg:          cfg,
+		admins:       admins,
+		authBotToken: authBotToken,
+		logger:       logger,
 	}
 	logger.Info("bot ready",
 		"bot_id", api.Self.ID,
@@ -236,6 +243,8 @@ func (b *Bot) handleUpdate(ctx context.Context, update tgbotapi.Update) {
 			reply, err = b.handleStart(ctx, msg)
 		case "help":
 			reply, err = b.handleHelp(ctx, msg)
+		case "weblogin":
+			reply, err = b.handleWebLogin(ctx, msg)
 		default:
 			return
 		}

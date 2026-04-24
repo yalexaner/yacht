@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/bot"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
@@ -77,10 +78,16 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	shareSvc := share.New(handle, store, cfg.Shared)
 
+	// auth.NewBotToken owns the login_tokens table for the /weblogin bot
+	// command (mint side) and the web binary's /auth/{token} handler
+	// (consume side). Construct it here so the bot can mint tokens with the
+	// same DB handle the web binary will later consume them from.
+	authBotToken := auth.NewBotToken(handle)
+
 	// nil downloader signals "use the default HTTP downloader" — keeps main
 	// from having to import net/http just to pass through a dependency that
 	// bot.New can build itself. Tests inject an explicit fake instead.
-	b, err := bot.New(ctx, cfg, handle, shareSvc, nil, logger)
+	b, err := bot.New(ctx, cfg, handle, shareSvc, authBotToken, nil, logger)
 	if err != nil {
 		return fmt.Errorf("init bot: %w", err)
 	}

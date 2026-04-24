@@ -2,13 +2,27 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/share"
 )
+
+// webLoginTokenTTL is how long a /weblogin-issued link stays valid. Short
+// enough that a token lost in a screenshot or chat scrollback is likely
+// stale by the time anyone could abuse it, long enough that the user has
+// comfortable room to switch tabs, paste the URL, and hit enter.
+const webLoginTokenTTL = 5 * time.Minute
+
+// webLoginRateLimitedReply is the copy sent when CreateLoginToken returns
+// ErrRateLimited. Mentions the earlier message explicitly so the user
+// remembers to scroll back rather than re-requesting again and again.
+const webLoginRateLimitedReply = "You already requested a login link recently — check earlier messages. Try again in a minute."
 
 // genericErrorReply is the copy sent when a share fails for any reason the
 // user can't act on (DB/storage/Telegram hiccups). The message intentionally
@@ -29,6 +43,45 @@ func (b *Bot) handleStart(_ context.Context, msg *tgbotapi.Message) (tgbotapi.Me
 			"Links expire after %s. Only allowlisted Telegram accounts can use this bot.",
 		b.cfg.DefaultExpiry,
 	)
+	return tgbotapi.NewMessage(msg.Chat.ID, body), nil
+}
+
+// handleWebLogin mints a one-time login token via auth.BotToken and replies
+// with the user-facing URL that redeems it. Used by operators whose network
+// or browser blocks the Telegram Login Widget (corporate DNS, content
+// blockers, etc.) — the bot flow sidesteps the widget entirely.
+//
+// The rate-limit branch is surfaced verbatim so the user can recover without
+// a round-trip to the operator: "check earlier messages, try again in a
+// minute". Any other error collapses to the same generic reply the file
+// handlers use, because the remaining failure modes (DB down, OS out of
+// entropy) are not actionable to the user and exposing details could leak
+// internals if the dispatcher's auth check ever regressed.
+//
+// The defensive zero-value return covers an unauthorized sender reaching
+// this handler — the dispatcher already filters those out, but the
+// belt-and-suspenders check keeps a routing regression from leaking a token
+// to a non-admin.
+func (b *Bot) handleWebLogin(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
+	userID, ok := b.admins[msg.From.ID]
+	if !ok {
+		return tgbotapi.MessageConfig{}, nil
+	}
+
+	token, err := b.authBotToken.CreateLoginToken(ctx, userID, webLoginTokenTTL)
+	if errors.Is(err, auth.ErrRateLimited) {
+		return tgbotapi.NewMessage(msg.Chat.ID, webLoginRateLimitedReply), nil
+	}
+	if err != nil {
+		b.logger.ErrorContext(ctx, "create login token", "err", err, "telegram_id", msg.From.ID)
+		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+	}
+
+	// TrimRight normalises a trailing slash on BaseURL so an operator
+	// setting BASE_URL=https://example.com/ doesn't produce a double-slashed
+	// login URL. Same reasoning as buildShareReply.
+	url := strings.TrimRight(b.cfg.BaseURL, "/") + "/auth/" + token
+	body := fmt.Sprintf("Login link (expires in 5 min):\n%s", url)
 	return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 }
 

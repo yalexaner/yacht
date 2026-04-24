@@ -15,6 +15,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
 	"github.com/yalexaner/yacht/internal/share"
@@ -376,12 +377,13 @@ func newTestBot(t *testing.T) *testBot {
 	dl := &fakeDownloader{}
 
 	b := &Bot{
-		api:        api,
-		downloader: dl,
-		share:      svc,
-		cfg:        cfg,
-		admins:     admins,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		api:          api,
+		downloader:   dl,
+		share:        svc,
+		cfg:          cfg,
+		admins:       admins,
+		authBotToken: auth.NewBotToken(handle),
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return &testBot{
 		bot:      b,
@@ -1765,6 +1767,208 @@ func TestTgLoggerRedactsToken(t *testing.T) {
 				t.Errorf("tgLogger missing redaction marker: %q", logged)
 			}
 		})
+	}
+}
+
+// countLoginTokens returns the number of login_tokens rows owned by a user —
+// sufficient to assert that a failed mint (rate limit, validation) did not
+// leak a row into the table.
+func countLoginTokens(t *testing.T, handle *sql.DB, userID int64) int {
+	t.Helper()
+
+	var n int
+	if err := handle.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM login_tokens WHERE user_id = ?`,
+		userID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count login_tokens: %v", err)
+	}
+	return n
+}
+
+func TestHandleWebLogin_HappyPath(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example"
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG},
+	}
+	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleWebLogin: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/auth/") {
+		t.Errorf("reply.Text missing login URL; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "expires in 5 min") {
+		t.Errorf("reply.Text missing TTL hint; got %q", reply.Text)
+	}
+
+	// a mint should have landed exactly one unused row for this admin; the
+	// test guards against both "silently skipped" and "inserted twice".
+	if n := countLoginTokens(t, tb.db, tb.adminRow); n != 1 {
+		t.Errorf("login_tokens rows for admin = %d, want 1", n)
+	}
+	var usedAt sql.NullInt64
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT used_at FROM login_tokens WHERE user_id = ?`,
+		tb.adminRow,
+	).Scan(&usedAt); err != nil {
+		t.Fatalf("lookup login_token row: %v", err)
+	}
+	if usedAt.Valid {
+		t.Errorf("used_at = %v, want NULL (token must be unused on mint)", usedAt.Int64)
+	}
+}
+
+func TestHandleWebLogin_TrimsBaseURLTrailingSlash(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example/"
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG},
+	}
+	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleWebLogin: %v", err)
+	}
+
+	// BASE_URL with a trailing slash must not produce a double-slash in the
+	// path — same reasoning as the share-reply TrimRight test.
+	if strings.Contains(reply.Text, "//auth/") {
+		t.Errorf("reply.Text should not contain double slash before /auth/; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/auth/") {
+		t.Errorf("reply.Text missing normalised login URL; got %q", reply.Text)
+	}
+}
+
+func TestHandleWebLogin_RateLimited(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example"
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG},
+	}
+	if _, err := tb.bot.handleWebLogin(context.Background(), msg); err != nil {
+		t.Fatalf("first handleWebLogin: %v", err)
+	}
+
+	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("second handleWebLogin: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(reply.Text, "already requested") {
+		t.Errorf("reply.Text missing rate-limit notice; got %q", reply.Text)
+	}
+	if strings.Contains(reply.Text, "/auth/") {
+		t.Errorf("reply.Text leaks a login URL on the rate-limited path; got %q", reply.Text)
+	}
+
+	// one successful mint, one rejected — the rate-limit branch must not
+	// have inserted a second row.
+	if n := countLoginTokens(t, tb.db, tb.adminRow); n != 1 {
+		t.Errorf("login_tokens rows for admin = %d, want 1 (rate-limited call must not insert)", n)
+	}
+}
+
+func TestHandleWebLogin_CreateTokenError(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example"
+
+	// force CreateLoginToken to fail by closing the DB handle before the
+	// call — same pattern as TestHandleText_ShareCreationError.
+	if err := tb.db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG},
+	}
+	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleWebLogin: %v", err)
+	}
+
+	if reply.ChatID != 42 {
+		t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+	}
+	if !strings.Contains(strings.ToLower(reply.Text), "try again") {
+		t.Errorf("reply.Text missing try-again notice; got %q", reply.Text)
+	}
+	if strings.Contains(reply.Text, "/auth/") {
+		t.Errorf("reply.Text leaks a login URL on the error path; got %q", reply.Text)
+	}
+}
+
+func TestHandleWebLogin_UnauthorizedSender(t *testing.T) {
+	tb := newTestBot(t)
+
+	// defence-in-depth: the dispatcher filters unauthorized senders, but the
+	// handler is expected to no-op if one sneaks through. Locks in that a
+	// routing change can't leak a login token to a non-admin via this path.
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG + 1},
+	}
+	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleWebLogin: %v", err)
+	}
+	if reply.ChatID != 0 || reply.Text != "" {
+		t.Errorf("want zero-value MessageConfig, got ChatID=%d text=%q", reply.ChatID, reply.Text)
+	}
+
+	var n int
+	if err := tb.db.QueryRowContext(
+		context.Background(),
+		`SELECT COUNT(*) FROM login_tokens`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count login_tokens: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("login_tokens row count = %d, want 0 (unauthorized sender must not mint)", n)
+	}
+}
+
+func TestHandleUpdate_RoutesWebLoginCommand(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example"
+
+	tb.bot.handleUpdate(context.Background(), newCommandUpdate(tb, 42, "weblogin"))
+
+	if len(tb.api.sent) != 1 {
+		t.Fatalf("api.Send called %d times, want 1", len(tb.api.sent))
+	}
+	sent, ok := tb.api.sent[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatalf("sent payload = %T, want tgbotapi.MessageConfig", tb.api.sent[0])
+	}
+	if sent.ChatID != 42 {
+		t.Errorf("sent.ChatID = %d, want 42", sent.ChatID)
+	}
+	if !strings.Contains(sent.Text, "https://yacht.example/auth/") {
+		t.Errorf("sent.Text missing login URL; got %q", sent.Text)
+	}
+
+	// the dispatched handler must have persisted a token; if we see zero
+	// rows the /weblogin command did NOT reach handleWebLogin (routing gap).
+	if n := countLoginTokens(t, tb.db, tb.adminRow); n != 1 {
+		t.Errorf("login_tokens rows for admin = %d, want 1", n)
 	}
 }
 
