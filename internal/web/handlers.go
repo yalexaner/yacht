@@ -211,6 +211,43 @@ func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// logoutHandler serves POST /logout: deletes the caller's server-side
+// session row, clears the yacht_session cookie in the response, and sends
+// the browser back to /login with 303 See Other.
+//
+// POST (not GET) because a GET /logout would trigger on any link prefetch,
+// image load, or browser preload — a trivial cross-origin <img src=...> tag
+// could log the user out. The SameSite=Lax cookie blocks cross-origin POSTs
+// by default, so a form submission from our own login page is the only way
+// to reach this handler in the happy path.
+//
+// DeleteSession errors are logged and swallowed: the cookie gets cleared
+// regardless, so the user's browser is in the right state. A DB failure
+// here at worst leaves an orphan session row that the cleanup worker
+// removes the next time it runs.
+//
+// No cookie on the request is a legitimate case — a stale tab, a user who
+// never logged in, a bot probing the endpoint — so we redirect to /login
+// without fanfare rather than surfacing an error.
+func (s *Server) logoutHandler(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(s.cfg.SessionCookieName); err == nil && c.Value != "" {
+		if err := auth.DeleteSession(r.Context(), s.db, c.Value); err != nil {
+			s.logger.Warn("delete session on logout", "err", err)
+		}
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.cfg.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsTLS(r),
+	})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
 // healthzHandler is the liveness probe: no DB ping, no storage ping, just
 // proves the process accepted the TCP connection and routed the request. A
 // 200 here tells a health checker (Caddy, Docker, uptime monitor) that the

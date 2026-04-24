@@ -112,6 +112,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /login", s.loginHandler)
 	mux.HandleFunc("GET /auth/telegram/callback", s.telegramCallbackHandler)
 	mux.HandleFunc("GET /auth/{token}", s.botTokenHandler)
+	mux.HandleFunc("POST /logout", s.logoutHandler)
 
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)
