@@ -50,6 +50,7 @@ var pageTemplates = []string{
 	"share_text.html",
 	"password.html",
 	"error.html",
+	"login.html",
 }
 
 // parseTemplates builds one fully-assembled template per page: a clone of

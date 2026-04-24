@@ -69,6 +69,42 @@ type errorView struct {
 	Message string
 }
 
+// loginView feeds login.html. BotUsername is the Telegram bot username used
+// both by the Login Widget's data-telegram-login attribute and by the
+// fallback text's @username link. Error is the human-readable message shown
+// when the login flow redirected the user back with an ?error= code; empty
+// on first display.
+type loginView struct {
+	BotUsername string
+	Error       string
+}
+
+// loginErrorMessages maps ?error= query codes produced by the auth handlers
+// (Tasks 7-9) to human-readable messages. Unknown codes resolve to an empty
+// string so an attacker cannot inject arbitrary text through the query
+// param — even though html/template would auto-escape it, not echoing
+// untrusted strings at all is the simpler guarantee.
+var loginErrorMessages = map[string]string{
+	"invalid_signature": "The Telegram login signature did not verify. Please try again.",
+	"access_denied":     "Access denied — your Telegram account is not authorized to log in.",
+	"invalid_link":      "That login link is not valid.",
+	"link_expired":      "Your login link has expired. Send /weblogin to the bot for a fresh one.",
+	"link_used":         "That login link has already been used.",
+}
+
+// loginHandler serves GET /login: the login page with the Telegram Login
+// Widget plus a fallback block pointing the user at the /weblogin bot
+// command for networks where the widget is blocked. An optional ?error=
+// query param surfaces a banner above the widget — only codes listed in
+// loginErrorMessages render anything; arbitrary values are dropped on the
+// floor so the page never echoes untrusted text.
+func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
+	s.render(w, http.StatusOK, "login.html", loginView{
+		BotUsername: s.cfg.TelegramBotUsername,
+		Error:       loginErrorMessages[r.URL.Query().Get("error")],
+	})
+}
+
 // healthzHandler is the liveness probe: no DB ping, no storage ping, just
 // proves the process accepted the TCP connection and routed the request. A
 // 200 here tells a health checker (Caddy, Docker, uptime monitor) that the

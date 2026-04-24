@@ -94,6 +94,8 @@ func (s *Server) Routes() http.Handler {
 
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.static))))
 
+	mux.HandleFunc("GET /login", s.loginHandler)
+
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)
 	mux.HandleFunc("GET /d/{id}", s.downloadHandler)
