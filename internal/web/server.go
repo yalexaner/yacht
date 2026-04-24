@@ -22,6 +22,7 @@ import (
 	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/share"
+	"github.com/yalexaner/yacht/internal/web/middleware"
 	webassets "github.com/yalexaner/yacht/web"
 )
 
@@ -119,6 +120,15 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /d/{id}", s.downloadHandler)
 
 	return s.logMiddleware(mux)
+}
+
+// RequireAuth returns the session-gate middleware preconfigured with this
+// server's DB handle and the configured session cookie name. Phase 9 defines
+// and tests the middleware but does not apply it to any route; Phase 10's
+// upload handlers are the first consumer and reach in via this accessor so
+// they don't need to know which cookie name or DB handle Server owns.
+func (s *Server) RequireAuth() func(http.Handler) http.Handler {
+	return middleware.RequireAuth(s.db, s.cfg.SessionCookieName)
 }
 
 // statusRecorder snapshots the outgoing HTTP status so logMiddleware can log
