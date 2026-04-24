@@ -121,4 +121,12 @@ func TestDSN_TranslatesSpecParams(t *testing.T) {
 			t.Errorf("dsn missing expected pragma %q; got %q", p, got)
 		}
 	}
+
+	// _txlock=immediate is the modernc-specific knob that makes BeginTx issue
+	// `BEGIN IMMEDIATE` so a deferred read-then-update transaction can't hit
+	// SQLITE_BUSY_SNAPSHOT under concurrent writers (botTokenHandler relies
+	// on this; see the WHY-comment on dsn).
+	if !strings.Contains(got, "_txlock=immediate") {
+		t.Errorf("dsn missing _txlock=immediate; got %q", got)
+	}
 }

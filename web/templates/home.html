@@ -1,0 +1,9 @@
+{{define "title"}}yacht{{end}}
+{{define "content"}}
+<h1>Logged in</h1>
+{{if .DisplayName}}<p>Welcome, {{.DisplayName}}.</p>{{else}}<p>Welcome.</p>{{end}}
+<p class="muted">Upload UI lands in a later phase. For now, send files or text to the bot to mint a share link.</p>
+<form method="post" action="/logout">
+  <button type="submit">Log out</button>
+</form>
+{{end}}

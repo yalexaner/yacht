@@ -45,6 +45,35 @@ func CreateSession(
 	provider string,
 	lifetime time.Duration,
 ) (string, error) {
+	return createSession(ctx, db, userID, provider, lifetime)
+}
+
+// CreateSessionTx is the transactional variant of CreateSession: identical
+// behaviour, but the INSERT runs against the supplied *sql.Tx so the caller
+// can compose session creation with other writes (e.g. atomically claiming
+// a one-time login token) under a single COMMIT. botTokenHandler uses this
+// to keep "mark token used" and "insert session" all-or-nothing.
+func CreateSessionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID int64,
+	provider string,
+	lifetime time.Duration,
+) (string, error) {
+	return createSession(ctx, tx, userID, provider, lifetime)
+}
+
+// createSession is the shared implementation backing CreateSession and
+// CreateSessionTx. Accepts the dbConn subset so either *sql.DB or *sql.Tx
+// satisfies the parameter without duplicating the SQL between the two
+// public entry points.
+func createSession(
+	ctx context.Context,
+	conn dbConn,
+	userID int64,
+	provider string,
+	lifetime time.Duration,
+) (string, error) {
 	id, err := generateSessionID()
 	if err != nil {
 		return "", err
@@ -53,7 +82,7 @@ func CreateSession(
 	now := time.Now().Unix()
 	expires := time.Now().Add(lifetime).Unix()
 
-	_, err = db.ExecContext(ctx, `
+	_, err = conn.ExecContext(ctx, `
 		INSERT INTO sessions (id, user_id, provider, expires_at, created_at)
 		VALUES (?, ?, ?, ?, ?)
 	`, id, userID, provider, expires, now)

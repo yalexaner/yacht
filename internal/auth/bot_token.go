@@ -112,6 +112,30 @@ func (b *BotToken) CreateLoginToken(
 	return token, nil
 }
 
+// LoginTokenExists reports whether a row exists in login_tokens for the
+// supplied token string. Returns ErrTokenNotFound when no row matches and
+// nil when one does — used_at / expires_at / is_admin are NOT inspected
+// here, so a returned nil only means "the token string is known", not
+// "redemption will succeed". The web handler calls this before opening the
+// write transaction in botTokenHandler so random invalid-token probes on
+// the unauthenticated /auth/{token} endpoint don't reserve the SQLite
+// writer slot just to discover the row is absent. Real validation runs
+// inside the tx via ConsumeLoginTokenTx, which is also where the
+// concurrent-redemption guard lives.
+func (b *BotToken) LoginTokenExists(ctx context.Context, token string) error {
+	var dummy int
+	err := b.db.QueryRowContext(ctx,
+		`SELECT 1 FROM login_tokens WHERE token = ?`, token,
+	).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("login token exists: %w", ErrTokenNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("login token exists: %w", err)
+	}
+	return nil
+}
+
 // ConsumeLoginToken resolves a login token string to a *User, marking
 // the row used_at = now as a side-effect on success. Failure modes:
 //
@@ -130,9 +154,31 @@ func (b *BotToken) CreateLoginToken(
 // usefully described as "already used" — the user saw a success
 // page once and may be confused why the second click fails.
 //
-// The UPDATE that sets used_at runs BEFORE the return, so an
-// immediate re-consume of the same token gets ErrTokenUsed.
+// Concurrent redemption of the same token is handled by a conditional
+// UPDATE — the "mark used" write only flips a row where used_at IS NULL,
+// and the caller whose RowsAffected comes back zero loses the race and
+// gets ErrTokenUsed. Without this guard, two in-flight requests with the
+// same token could both pass the usedAt.Valid check and both succeed,
+// defeating the single-use contract.
 func (b *BotToken) ConsumeLoginToken(ctx context.Context, token string) (*User, error) {
+	return consumeLoginToken(ctx, b.db, token)
+}
+
+// ConsumeLoginTokenTx is the transactional variant of ConsumeLoginToken:
+// identical validation and "atomic claim" semantics, but every read and
+// write runs against the supplied *sql.Tx so the caller can roll the
+// used_at flip back if a downstream write (e.g. session creation) fails.
+// Without this, ConsumeLoginToken would commit the mark-used immediately
+// and a session-INSERT failure on the same handler would permanently burn
+// the link.
+func (b *BotToken) ConsumeLoginTokenTx(ctx context.Context, tx *sql.Tx, token string) (*User, error) {
+	return consumeLoginToken(ctx, tx, token)
+}
+
+// consumeLoginToken is the shared implementation backing ConsumeLoginToken
+// and ConsumeLoginTokenTx. Accepts the dbConn subset so either *sql.DB or
+// *sql.Tx satisfies the parameter without duplicating the SQL.
+func consumeLoginToken(ctx context.Context, conn dbConn, token string) (*User, error) {
 	var (
 		u                     User
 		usedAt                sql.NullInt64
@@ -143,7 +189,7 @@ func (b *BotToken) ConsumeLoginToken(ctx context.Context, token string) (*User, 
 	// single JOIN mirrors GetSession: one round-trip for both the
 	// token metadata and the user row. Keeps the error branches
 	// linear and the SQL surface small.
-	err := b.db.QueryRowContext(ctx, `
+	err := conn.QueryRowContext(ctx, `
 		SELECT lt.user_id, lt.used_at, lt.expires_at,
 		       u.telegram_id, u.telegram_username, u.display_name, u.is_admin
 		FROM login_tokens lt
@@ -169,11 +215,24 @@ func (b *BotToken) ConsumeLoginToken(ctx context.Context, token string) (*User, 
 		return nil, fmt.Errorf("consume login token: %w", ErrUnauthorized)
 	}
 
-	if _, err := b.db.ExecContext(ctx,
-		`UPDATE login_tokens SET used_at = strftime('%s','now') WHERE token = ?`,
+	// atomic claim: the `used_at IS NULL` guard ensures only one concurrent
+	// consumer can flip the row. Any second caller that raced past the
+	// SELECT-then-check above sees RowsAffected == 0 here and is folded
+	// into the ErrTokenUsed branch.
+	res, err := conn.ExecContext(ctx,
+		`UPDATE login_tokens SET used_at = strftime('%s','now')
+		 WHERE token = ? AND used_at IS NULL`,
 		token,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, fmt.Errorf("consume login token: mark used: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("consume login token: rows affected: %w", err)
+	}
+	if affected == 0 {
+		return nil, fmt.Errorf("consume login token: %w", ErrTokenUsed)
 	}
 
 	u.Username = username.String

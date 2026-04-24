@@ -1221,7 +1221,7 @@ func newCommandUpdate(tb *testBot, chatID int64, cmd string) tgbotapi.Update {
 	text := "/" + cmd
 	return tgbotapi.Update{
 		Message: &tgbotapi.Message{
-			Chat: &tgbotapi.Chat{ID: chatID},
+			Chat: &tgbotapi.Chat{ID: chatID, Type: "private"},
 			From: &tgbotapi.User{ID: tb.adminTG},
 			Text: text,
 			Entities: []tgbotapi.MessageEntity{
@@ -1792,7 +1792,7 @@ func TestHandleWebLogin_HappyPath(t *testing.T) {
 	tb.bot.cfg.BaseURL = "https://yacht.example"
 
 	msg := &tgbotapi.Message{
-		Chat: &tgbotapi.Chat{ID: 42},
+		Chat: &tgbotapi.Chat{ID: 42, Type: "private"},
 		From: &tgbotapi.User{ID: tb.adminTG},
 	}
 	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
@@ -1808,6 +1808,13 @@ func TestHandleWebLogin_HappyPath(t *testing.T) {
 	}
 	if !strings.Contains(reply.Text, "expires in 5 min") {
 		t.Errorf("reply.Text missing TTL hint; got %q", reply.Text)
+	}
+	// DisableWebPagePreview must be true: Telegram's server-side preview
+	// crawler would otherwise GET the login URL to build an unfurl card,
+	// which consumes the one-time token before the user clicks. Losing this
+	// flag turns every /weblogin reply into "link already used".
+	if !reply.DisableWebPagePreview {
+		t.Error("reply.DisableWebPagePreview = false, want true (preview crawler would burn the token)")
 	}
 
 	// a mint should have landed exactly one unused row for this admin; the
@@ -1833,7 +1840,7 @@ func TestHandleWebLogin_TrimsBaseURLTrailingSlash(t *testing.T) {
 	tb.bot.cfg.BaseURL = "https://yacht.example/"
 
 	msg := &tgbotapi.Message{
-		Chat: &tgbotapi.Chat{ID: 42},
+		Chat: &tgbotapi.Chat{ID: 42, Type: "private"},
 		From: &tgbotapi.User{ID: tb.adminTG},
 	}
 	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
@@ -1856,7 +1863,7 @@ func TestHandleWebLogin_RateLimited(t *testing.T) {
 	tb.bot.cfg.BaseURL = "https://yacht.example"
 
 	msg := &tgbotapi.Message{
-		Chat: &tgbotapi.Chat{ID: 42},
+		Chat: &tgbotapi.Chat{ID: 42, Type: "private"},
 		From: &tgbotapi.User{ID: tb.adminTG},
 	}
 	if _, err := tb.bot.handleWebLogin(context.Background(), msg); err != nil {
@@ -1896,7 +1903,7 @@ func TestHandleWebLogin_CreateTokenError(t *testing.T) {
 	}
 
 	msg := &tgbotapi.Message{
-		Chat: &tgbotapi.Chat{ID: 42},
+		Chat: &tgbotapi.Chat{ID: 42, Type: "private"},
 		From: &tgbotapi.User{ID: tb.adminTG},
 	}
 	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
@@ -1922,7 +1929,7 @@ func TestHandleWebLogin_UnauthorizedSender(t *testing.T) {
 	// handler is expected to no-op if one sneaks through. Locks in that a
 	// routing change can't leak a login token to a non-admin via this path.
 	msg := &tgbotapi.Message{
-		Chat: &tgbotapi.Chat{ID: 42},
+		Chat: &tgbotapi.Chat{ID: 42, Type: "private"},
 		From: &tgbotapi.User{ID: tb.adminTG + 1},
 	}
 	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
@@ -1942,6 +1949,41 @@ func TestHandleWebLogin_UnauthorizedSender(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("login_tokens row count = %d, want 0 (unauthorized sender must not mint)", n)
+	}
+}
+
+// TestHandleWebLogin_NonPrivateChat locks in the group/supergroup/channel
+// refusal: minting a token for a chat with multiple members would publish a
+// usable single-use credential to everyone in the room, so the handler must
+// reply with the redirect-to-DM notice and not insert any login_tokens row.
+func TestHandleWebLogin_NonPrivateChat(t *testing.T) {
+	for _, chatType := range []string{"group", "supergroup", "channel"} {
+		t.Run(chatType, func(t *testing.T) {
+			tb := newTestBot(t)
+			tb.bot.cfg.BaseURL = "https://yacht.example"
+
+			msg := &tgbotapi.Message{
+				Chat: &tgbotapi.Chat{ID: 42, Type: chatType},
+				From: &tgbotapi.User{ID: tb.adminTG},
+			}
+			reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+			if err != nil {
+				t.Fatalf("handleWebLogin: %v", err)
+			}
+
+			if reply.ChatID != 42 {
+				t.Errorf("reply.ChatID = %d, want 42", reply.ChatID)
+			}
+			if !strings.Contains(reply.Text, "direct message") {
+				t.Errorf("reply.Text missing redirect-to-DM notice; got %q", reply.Text)
+			}
+			if strings.Contains(reply.Text, "/auth/") {
+				t.Errorf("reply.Text leaks a login URL into a non-private chat; got %q", reply.Text)
+			}
+			if n := countLoginTokens(t, tb.db, tb.adminRow); n != 0 {
+				t.Errorf("login_tokens rows for admin = %d, want 0 (non-private chat must not mint)", n)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -304,6 +305,125 @@ func TestBotTokenHandler_NotFound(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("session row count: want 0, got %d", count)
+	}
+}
+
+// TestBotTokenHandler_SessionCreateFailureKeepsTokenUnused: a transient
+// failure during session creation must roll back the token's used_at flip
+// so the user can retry the same link instead of being stuck behind the
+// 60-second /weblogin rate limit. Drops the sessions table mid-request to
+// force CreateSessionTx to fail; the test then asserts the handler returns
+// 500 AND the login_tokens row stays in its pre-consume state (used_at
+// IS NULL). Without the wrapping transaction, the consume would have
+// committed first and the token would be permanently burned.
+func TestBotTokenHandler_SessionCreateFailureKeepsTokenUnused(t *testing.T) {
+	srv, handle, bot := newBotTokenTestServer(t)
+	userID := insertBotTokenTestUser(t, handle, true)
+
+	token, err := bot.CreateLoginToken(context.Background(), userID, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("CreateLoginToken: %v", err)
+	}
+
+	// drop sessions so the INSERT inside CreateSessionTx returns an error,
+	// exercising the rollback path. The login_tokens read still works
+	// because that table is untouched.
+	if _, err := handle.ExecContext(context.Background(), `DROP TABLE sessions`); err != nil {
+		t.Fatalf("drop sessions: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/"+token, nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status: want 500 (session insert failed), got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if c := findCookie(rec, "yacht_session"); c != nil {
+		t.Errorf("session cookie must NOT be set when session insert failed; got %+v", c)
+	}
+
+	var usedAt sql.NullInt64
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT used_at FROM login_tokens WHERE token = ?`, token,
+	).Scan(&usedAt); err != nil {
+		t.Fatalf("lookup login_tokens: %v", err)
+	}
+	if usedAt.Valid {
+		t.Errorf("login_tokens.used_at = %v, want NULL after rollback (token must remain redeemable)", usedAt.Int64)
+	}
+}
+
+// TestBotTokenHandler_ConcurrentRedemption pins the contract that two
+// browsers racing on the same login link resolve to exactly one 303 → "/"
+// (the winner) and N-1 303 → "/login?error=link_used" (the losers). The
+// transactional consume in botTokenHandler runs read-then-update inside
+// one tx, so without _txlock=immediate in the DSN the loser's UPDATE could
+// surface SQLITE_BUSY_SNAPSHOT — which the handler's default branch maps
+// to 500 instead of the link_used redirect, breaking the user-visible
+// contract the non-transactional consume already preserves (see
+// auth.TestConsumeLoginToken_ConcurrentSingleUse).
+func TestBotTokenHandler_ConcurrentRedemption(t *testing.T) {
+	srv, handle, bot := newBotTokenTestServer(t)
+	userID := insertBotTokenTestUser(t, handle, true)
+
+	token, err := bot.CreateLoginToken(context.Background(), userID, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("CreateLoginToken: %v", err)
+	}
+
+	const racers = 8
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		success  int
+		linkUsed int
+		other    []int
+		start    = make(chan struct{})
+	)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodGet, "/auth/"+token, nil)
+			rec := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rec, req)
+
+			mu.Lock()
+			defer mu.Unlock()
+			loc := rec.Header().Get("Location")
+			switch {
+			case rec.Code == http.StatusSeeOther && loc == "/":
+				success++
+			case rec.Code == http.StatusSeeOther && loc == "/login?error=link_used":
+				linkUsed++
+			default:
+				other = append(other, rec.Code)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if success != 1 {
+		t.Errorf("success count = %d, want exactly 1", success)
+	}
+	if linkUsed != racers-1 {
+		t.Errorf("link_used count = %d, want %d", linkUsed, racers-1)
+	}
+	if len(other) > 0 {
+		t.Errorf("unexpected statuses from %d racers: %v", len(other), other)
+	}
+
+	var sessionCount int
+	if err := handle.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM sessions`,
+	).Scan(&sessionCount); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionCount != 1 {
+		t.Errorf("session row count = %d, want exactly 1 (only the winner mints a session)", sessionCount)
 	}
 }
 

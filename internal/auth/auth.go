@@ -40,6 +40,17 @@ type AuthProvider interface {
 	Verify(r *http.Request) (*User, error)
 }
 
+// dbConn is the subset of *sql.DB and *sql.Tx the auth package's queries
+// rely on. Accepting an interface lets the bot-token handler compose
+// ConsumeLoginToken and CreateSession inside a single transaction so a
+// session-create failure rolls back the token's used_at flip — without
+// the shared interface, the two helpers could only run on a *sql.DB and
+// the second's failure would permanently burn the link.
+type dbConn interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // User is the in-memory projection of a users row, hydrated by every login
 // path (widget Verify, token Consume, session Get) and consumed by the
 // middleware's request context. DisplayName and Username can be empty when

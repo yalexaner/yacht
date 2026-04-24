@@ -24,6 +24,13 @@ const webLoginTokenTTL = 5 * time.Minute
 // remembers to scroll back rather than re-requesting again and again.
 const webLoginRateLimitedReply = "You already requested a login link recently — check earlier messages. Try again in a minute."
 
+// webLoginNonPrivateReply is the copy sent when /weblogin is issued from a
+// group, supergroup, or channel. The login URL is a single-use credential —
+// echoing it into a multi-member chat would expose it to every other member,
+// who could then redeem it before the legitimate sender. Refuse the mint
+// outright and tell the operator to DM the bot.
+const webLoginNonPrivateReply = "Send /weblogin in a direct message to me — login links must not be posted in group chats."
+
 // genericErrorReply is the copy sent when a share fails for any reason the
 // user can't act on (DB/storage/Telegram hiccups). The message intentionally
 // says nothing about the underlying cause — operators diagnose via logs, and
@@ -68,6 +75,15 @@ func (b *Bot) handleWebLogin(ctx context.Context, msg *tgbotapi.Message) (tgbota
 		return tgbotapi.MessageConfig{}, nil
 	}
 
+	// Reject group/supergroup/channel chats before minting: the reply text
+	// embeds the one-time token URL, and the dispatcher would forward it to
+	// msg.Chat.ID — i.e. the group — leaking a usable credential to every
+	// other member. IsPrivate() is the positive form, so anything that isn't
+	// a private 1:1 chat falls through to the refusal.
+	if !msg.Chat.IsPrivate() {
+		return tgbotapi.NewMessage(msg.Chat.ID, webLoginNonPrivateReply), nil
+	}
+
 	token, err := b.authBotToken.CreateLoginToken(ctx, userID, webLoginTokenTTL)
 	if errors.Is(err, auth.ErrRateLimited) {
 		return tgbotapi.NewMessage(msg.Chat.ID, webLoginRateLimitedReply), nil
@@ -82,7 +98,14 @@ func (b *Bot) handleWebLogin(ctx context.Context, msg *tgbotapi.Message) (tgbota
 	// login URL. Same reasoning as buildShareReply.
 	url := strings.TrimRight(b.cfg.BaseURL, "/") + "/auth/" + token
 	body := fmt.Sprintf("Login link (expires in 5 min):\n%s", url)
-	return tgbotapi.NewMessage(msg.Chat.ID, body), nil
+	reply := tgbotapi.NewMessage(msg.Chat.ID, body)
+	// DisableWebPagePreview blocks Telegram's server-side link-preview
+	// crawler from issuing GET /auth/{token} to render an unfurl card —
+	// that GET would consume the one-time token before the user ever clicks,
+	// leaving them stuck on "link already used" with a fresh /weblogin
+	// gated by the 60s rate limit.
+	reply.DisableWebPagePreview = true
+	return reply, nil
 }
 
 // handleHelp renders the help copy sent in response to /help. The body mirrors

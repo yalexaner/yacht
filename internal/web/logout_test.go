@@ -168,6 +168,41 @@ func TestLogout_NoCookie(t *testing.T) {
 	}
 }
 
+// TestLogout_SecureOverTLS: the clearing cookie must carry Secure whenever
+// the request arrived over TLS (direct r.TLS or via X-Forwarded-Proto from a
+// reverse proxy). Browsers require attribute-match when deleting cookies, so
+// clearing a Secure-minted session with a non-Secure Set-Cookie may leave the
+// original behind. Mirrors the callback + bot-token Secure assertions.
+func TestLogout_SecureOverTLS(t *testing.T) {
+	srv, handle := newLogoutTestServer(t)
+	userID := insertLogoutTestUser(t, handle)
+
+	sessionID, err := auth.CreateSession(context.Background(), handle, userID, "telegram_widget", 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.AddCookie(&http.Cookie{Name: "yacht_session", Value: sessionID})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status: want 303, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	c := findCookie(rec, "yacht_session")
+	if c == nil {
+		t.Fatalf("clearing cookie not set; Set-Cookie headers: %v", rec.Header().Values("Set-Cookie"))
+	}
+	if !c.Secure {
+		t.Error("cookie Secure: want true for X-Forwarded-Proto=https, got false")
+	}
+	if c.MaxAge != -1 {
+		t.Errorf("cookie MaxAge: want -1 (clear), got %d", c.MaxAge)
+	}
+}
+
 // TestLogout_UnknownSessionID: a POST /logout with a session cookie whose
 // value doesn't match any row still clears the cookie and redirects.
 // auth.DeleteSession is idempotent on missing rows, so this case is indistinguishable

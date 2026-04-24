@@ -1046,6 +1046,66 @@ func TestLogMiddleware_CapturesStatus(t *testing.T) {
 	}
 }
 
+// TestLogMiddleware_RedactsLoginToken: the bot-token fallback route puts
+// the one-time login token directly in the URL path (`GET /auth/{token}`),
+// so logMiddleware must never emit the raw path verbatim — anyone with
+// log access would otherwise hold a live credential for the window
+// before the token is consumed. The widget callback path and every
+// non-/auth path are left alone.
+func TestLogMiddleware_RedactsLoginToken(t *testing.T) {
+	token := "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+	cases := []struct {
+		name     string
+		path     string
+		wantPath string
+		absent   string
+	}{
+		{
+			name:     "bot_token_path_redacted",
+			path:     "/auth/" + token,
+			wantPath: "/auth/[REDACTED]",
+			absent:   token,
+		},
+		{
+			name:     "telegram_callback_preserved",
+			path:     "/auth/telegram/callback",
+			wantPath: "/auth/telegram/callback",
+		},
+		{
+			name:     "non_auth_path_preserved",
+			path:     "/healthz",
+			wantPath: "/healthz",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			cfg := &config.Web{Shared: &config.Shared{}}
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			srv, err := New(cfg, nil, nil, nil, nil, logger)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			handler := srv.logMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			log := buf.String()
+			if !strings.Contains(log, `"path":"`+tc.wantPath+`"`) {
+				t.Errorf("log path: want %q, got: %s", tc.wantPath, log)
+			}
+			if tc.absent != "" && strings.Contains(log, tc.absent) {
+				t.Errorf("log leaked secret %q; got: %s", tc.absent, log)
+			}
+		})
+	}
+}
+
 // TestShare_TextAutoEscapesHTML guards Phase 7's XSS story: user-supplied
 // text content goes through html/template into a <pre> block, so any markup
 // the uploader types — a <script> tag, an onerror payload, raw HTML — must

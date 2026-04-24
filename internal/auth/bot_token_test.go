@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -204,6 +205,52 @@ func TestConsumeLoginToken_HappyPath(t *testing.T) {
 	}
 }
 
+// TestLoginTokenExists_Found returns nil for a row that's present in
+// login_tokens regardless of its used_at / expires_at state. The pre-check
+// only proves the token string is known; full validation is the tx-side
+// caller's job.
+func TestLoginTokenExists_Found(t *testing.T) {
+	handle := newTestDB(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, handle, 5101, true)
+	b := NewBotToken(handle)
+
+	token, err := b.CreateLoginToken(ctx, userID, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("CreateLoginToken: %v", err)
+	}
+
+	if err := b.LoginTokenExists(ctx, token); err != nil {
+		t.Errorf("LoginTokenExists for live token: want nil, got %v", err)
+	}
+
+	// flip used_at — LoginTokenExists still returns nil because it does
+	// not inspect token state.
+	if _, err := handle.ExecContext(ctx,
+		`UPDATE login_tokens SET used_at = strftime('%s','now') WHERE token = ?`, token,
+	); err != nil {
+		t.Fatalf("mark used: %v", err)
+	}
+	if err := b.LoginTokenExists(ctx, token); err != nil {
+		t.Errorf("LoginTokenExists for used token: want nil (existence-only check), got %v", err)
+	}
+}
+
+// TestLoginTokenExists_NotFound returns ErrTokenNotFound for a token string
+// that has no row. Lets the web handler short-circuit invalid /auth/{token}
+// probes before opening the BEGIN IMMEDIATE write transaction.
+func TestLoginTokenExists_NotFound(t *testing.T) {
+	handle := newTestDB(t)
+	ctx := context.Background()
+	b := NewBotToken(handle)
+
+	err := b.LoginTokenExists(ctx, "0000000000000000000000000000000000000000000000000000000000000000")
+	if !errors.Is(err, ErrTokenNotFound) {
+		t.Errorf("LoginTokenExists for unknown token: want ErrTokenNotFound, got %v", err)
+	}
+}
+
 func TestConsumeLoginToken_NotFound(t *testing.T) {
 	handle := newTestDB(t)
 	ctx := context.Background()
@@ -269,6 +316,65 @@ func TestConsumeLoginToken_Expired(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTokenExpired) {
 		t.Errorf("expected ErrTokenExpired, got %v", err)
+	}
+}
+
+// TestConsumeLoginToken_ConcurrentSingleUse pins the atomic-claim
+// contract: two goroutines racing on the same token must resolve to
+// exactly one successful consume and one ErrTokenUsed, never to two
+// successes. Without the conditional UPDATE in ConsumeLoginToken both
+// callers could pass the "usedAt.Valid" check on their SELECT and
+// both return a user, violating the single-use guarantee.
+func TestConsumeLoginToken_ConcurrentSingleUse(t *testing.T) {
+	handle := newTestDB(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, handle, 5008, true)
+	b := NewBotToken(handle)
+
+	token, err := b.CreateLoginToken(ctx, userID, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("CreateLoginToken: %v", err)
+	}
+
+	const racers = 8
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		success int
+		used    int
+		other   []error
+		start   = make(chan struct{})
+	)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			u, err := b.ConsumeLoginToken(ctx, token)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil && u != nil:
+				success++
+			case errors.Is(err, ErrTokenUsed):
+				used++
+			default:
+				other = append(other, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if success != 1 {
+		t.Errorf("success count = %d, want exactly 1", success)
+	}
+	if used != racers-1 {
+		t.Errorf("ErrTokenUsed count = %d, want %d", used, racers-1)
+	}
+	if len(other) > 0 {
+		t.Errorf("unexpected errors from %d racers: %v", len(other), other)
 	}
 }
 

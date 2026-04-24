@@ -15,6 +15,7 @@ import (
 	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/share"
 	"github.com/yalexaner/yacht/internal/storage"
+	"github.com/yalexaner/yacht/internal/web/middleware"
 )
 
 // shareCookieMaxAge bounds the lifetime of the per-share unlock cookie. Five
@@ -70,6 +71,14 @@ type errorView struct {
 	Message string
 }
 
+// homeView feeds home.html. DisplayName is rendered into the greeting
+// when the joined users row carries one; an empty string falls back to a
+// generic "Welcome." line so the page stays well-formed for accounts that
+// never set a Telegram display name.
+type homeView struct {
+	DisplayName string
+}
+
 // loginView feeds login.html. BotUsername is the Telegram bot username used
 // both by the Login Widget's data-telegram-login attribute and by the
 // fallback text's @username link. Error is the human-readable message shown
@@ -91,6 +100,26 @@ var loginErrorMessages = map[string]string{
 	"invalid_link":      "That login link is not valid.",
 	"link_expired":      "Your login link has expired. Send /weblogin to the bot for a fresh one.",
 	"link_used":         "That login link has already been used.",
+}
+
+// homeHandler serves GET /: the post-login landing page. Wired behind
+// RequireAuth at the mux, so by the time we get here the request carries
+// a hydrated *auth.User in its context — a cookie-less or expired-session
+// visitor was already bounced to /login by the middleware. The defensive
+// branch covers a routing regression that ever lets the handler run
+// without the gate.
+//
+// Phase 9 only needs a placeholder home: a greeting plus a logout form.
+// Phase 10's upload UI replaces this view with the real composer; the
+// route binding stays the same so the redirect target after login keeps
+// working through that swap.
+func (s *Server) homeHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	s.render(w, http.StatusOK, "home.html", homeView{DisplayName: user.DisplayName})
 }
 
 // loginHandler serves GET /login: the login page with the Telegram Login
@@ -158,19 +187,58 @@ func (s *Server) telegramCallbackHandler(w http.ResponseWriter, r *http.Request)
 }
 
 // botTokenHandler serves GET /auth/{token}: the one-time login link the bot
-// DMs a user in response to /weblogin. ConsumeLoginToken atomically validates
-// the token and flips used_at on the row, so an immediate second click gets
-// ErrTokenUsed rather than re-authenticating. The four expected failure
-// modes each map to a distinct ?error= code on the login page — the user
-// needs a different message for "typo" vs "link expired" vs "already
-// clicked" vs "your account is not authorized".
+// DMs a user in response to /weblogin. ConsumeLoginTokenTx atomically
+// validates the token and flips used_at on the row, so an immediate second
+// click gets ErrTokenUsed rather than re-authenticating. The four expected
+// failure modes each map to a distinct ?error= code on the login page —
+// the user needs a different message for "typo" vs "link expired" vs
+// "already clicked" vs "your account is not authorized".
+//
+// The token consume and the session insert run inside a single transaction
+// so a session-INSERT failure rolls back the used_at flip — without the
+// transaction, a transient DB error after the consume would permanently
+// burn the link and leave the user rate-limited (60s) on /weblogin for a
+// fault that wasn't theirs.
+//
+// /auth/{token} is unauthenticated, so a cheap read-only existence check
+// runs first. _txlock=immediate makes BeginTx grab the SQLite writer slot
+// up front; without the pre-check, random invalid-token probes would
+// reserve that slot for the duration of every fuzzed URL and queue
+// unrelated writes from both binaries. The pre-check uses a pooled reader
+// (no writer lock), and the conditional UPDATE inside ConsumeLoginTokenTx
+// still owns the atomic single-use guarantee — so a token that exists at
+// pre-check time but is consumed by another caller before the tx opens
+// still resolves to ErrTokenUsed for the loser.
 //
 // On success we mint a session tied to the bot_token provider, set the
 // yacht_session cookie (same attributes as the telegram widget path), and
 // redirect to "/" with 303 See Other.
 func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
-	user, err := s.authBotToken.ConsumeLoginToken(r.Context(), token)
+
+	if err := s.authBotToken.LoginTokenExists(r.Context(), token); err != nil {
+		switch {
+		case errors.Is(err, auth.ErrTokenNotFound):
+			http.Redirect(w, r, "/login?error=invalid_link", http.StatusSeeOther)
+		default:
+			s.logger.Error("bot token exists check", "err", err)
+			s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		}
+		return
+	}
+
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		s.logger.Error("begin tx (bot token)", "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+	// Rollback is a no-op after a successful Commit, so the defer is safe
+	// across both happy- and error-paths and removes the every-branch
+	// boilerplate that would otherwise leak a tx on an early return.
+	defer func() { _ = tx.Rollback() }()
+
+	user, err := s.authBotToken.ConsumeLoginTokenTx(r.Context(), tx, token)
 	switch {
 	case err == nil:
 		// fall through to session creation below.
@@ -192,9 +260,15 @@ func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID, err := auth.CreateSession(r.Context(), s.db, user.ID, s.authBotToken.Name(), s.cfg.SessionLifetime)
+	sessionID, err := auth.CreateSessionTx(r.Context(), tx, user.ID, s.authBotToken.Name(), s.cfg.SessionLifetime)
 	if err != nil {
 		s.logger.Error("create session (bot token)", "user_id", user.ID, "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		s.logger.Error("commit (bot token)", "user_id", user.ID, "err", err)
 		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
 		return
 	}

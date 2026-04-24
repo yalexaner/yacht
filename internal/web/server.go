@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/yalexaner/yacht/internal/auth"
@@ -115,6 +116,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /auth/{token}", s.botTokenHandler)
 	mux.HandleFunc("POST /logout", s.logoutHandler)
 
+	// GET / is gated behind RequireAuth so the post-login redirect lands
+	// somewhere meaningful: an authed visitor sees the placeholder home,
+	// an unauthed one is bounced back to /login by the middleware (which
+	// is exactly the loop we want — without this route, "/" would 404 and
+	// the login flow would look broken on success).
+	mux.Handle("GET /{$}", s.RequireAuth()(http.HandlerFunc(s.homeHandler)))
+
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)
 	mux.HandleFunc("GET /d/{id}", s.downloadHandler)
@@ -160,6 +168,9 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 // until proper metrics land, so every route — including /healthz — goes
 // through it; noisy liveness probes are preferable to a deployment where we
 // can't tell whether a request ever reached the binary.
+//
+// Paths are run through sanitizePathForLog so one-time login tokens in the
+// /auth/{token} flow don't land in logs as usable credentials.
 func (s *Server) logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -167,9 +178,28 @@ func (s *Server) logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rec, r)
 		s.logger.Info("request",
 			"method", r.Method,
-			"path", r.URL.Path,
+			"path", sanitizePathForLog(r.URL.Path),
 			"status", rec.status,
 			"duration", time.Since(start),
 		)
 	})
+}
+
+// sanitizePathForLog redacts the secret segment of /auth/{token} URLs so a
+// one-time login token never lands in request logs. The widget callback
+// path /auth/telegram/callback carries no secret in its path (the signed
+// fields ride in the query string, which logMiddleware never logs) and is
+// returned unchanged. Every other /auth/<segment> shape collapses to
+// /auth/[REDACTED] because the bot-token route uses a single path segment
+// as the credential itself.
+func sanitizePathForLog(path string) string {
+	const authPrefix = "/auth/"
+	if !strings.HasPrefix(path, authPrefix) {
+		return path
+	}
+	rest := path[len(authPrefix):]
+	if rest == "" || rest == "telegram/callback" {
+		return path
+	}
+	return authPrefix + "[REDACTED]"
 }

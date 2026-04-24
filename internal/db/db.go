@@ -30,11 +30,26 @@ import (
 // The driver applies `busy_timeout` first and the rest in lexicographic order
 // on every new pooled connection, so WAL + FK + timeout are all in effect for
 // every query issued through the returned *sql.DB.
+//
+// _txlock=immediate makes every BeginTx call issue `BEGIN IMMEDIATE` instead
+// of the stdlib default `BEGIN DEFERRED`. In WAL mode a deferred transaction
+// starts as a reader and only upgrades to a writer on the first write — if
+// another connection committed a write between this transaction's first read
+// and its upgrade attempt, SQLite returns SQLITE_BUSY_SNAPSHOT, which the
+// busy_timeout handler does NOT retry (the snapshot is irreparably stale).
+// botTokenHandler runs read-then-update inside one transaction, so two
+// concurrent redemptions of the same login link could otherwise have one
+// caller crash on SQLITE_BUSY_SNAPSHOT instead of cleanly receiving
+// ErrTokenUsed. IMMEDIATE acquires the writer lock at BEGIN — the loser
+// blocks (up to busy_timeout) until the winner commits, then proceeds with a
+// fresh snapshot and sees used_at != NULL on its SELECT. ReadOnly tx options
+// are exempt by the driver, so this only affects write transactions.
 func dsn(dbPath string) string {
 	q := url.Values{}
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(true)")
+	q.Set("_txlock", "immediate")
 	return "file:" + dbPath + "?" + q.Encode()
 }
 
