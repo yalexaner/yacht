@@ -163,32 +163,32 @@
 ## Phase 9: Web auth
 
 ### Foundations
-- [ ] `internal/auth/auth.go` — `AuthProvider` interface, `User` type
-- [ ] `internal/auth/sessions.go` — create/get/delete sessions by cookie
+- [x] `internal/auth/auth.go` — `AuthProvider` interface, `User` type
+- [x] `internal/auth/sessions.go` — create/get/delete sessions by cookie
 
 ### Telegram Login Widget
-- [ ] `internal/auth/telegram_widget.go` implementing `AuthProvider`
-- [ ] `Verify` validates HMAC against bot token per [Telegram docs](https://core.telegram.org/widgets/login)
-- [ ] `GET /auth/telegram/callback` handler
-- [ ] Login page template with widget script
+- [x] `internal/auth/telegram_widget.go` implementing `AuthProvider`
+- [x] `Verify` validates HMAC against bot token per [Telegram docs](https://core.telegram.org/widgets/login)
+- [x] `GET /auth/telegram/callback` handler
+- [x] Login page template with widget script
 
 ### Bot-token fallback
-- [ ] `internal/auth/bot_token.go` implementing `AuthProvider`
-- [ ] Bot handler for `/weblogin`:
-  - [ ] Generate token, insert with 5-min expiry
-  - [ ] Rate-limit: one per user per minute
-  - [ ] Reply with `BASE_URL/auth/<token>`
-- [ ] Web handler `GET /auth/{token}`:
-  - [ ] Validate not used, not expired
-  - [ ] Mark used, create session, set cookie, redirect to `/`
+- [x] `internal/auth/bot_token.go` implementing `AuthProvider`
+- [x] Bot handler for `/weblogin`:
+  - [x] Generate token, insert with 5-min expiry
+  - [x] Rate-limit: one per user per minute
+  - [x] Reply with `BASE_URL/auth/<token>`
+- [x] Web handler `GET /auth/{token}`:
+  - [x] Validate not used, not expired
+  - [x] Mark used, create session, set cookie, redirect to `/`
 
 ### Login page
-- [ ] Template with widget area
-- [ ] Always-visible warning block (EN only at this phase, RU added in Phase 11)
-- [ ] Logout endpoint `POST /logout` clears session + cookie
+- [x] Template with widget area
+- [x] Always-visible warning block (EN only at this phase, RU added in Phase 11)
+- [x] Logout endpoint `POST /logout` clears session + cookie
 
 ### Middleware
-- [ ] `internal/web/middleware/auth.go` — guards upload routes, redirects to `/login` if no session
+- [x] `internal/web/middleware/auth.go` — guards upload routes, redirects to `/login` if no session
 
 ---
 
