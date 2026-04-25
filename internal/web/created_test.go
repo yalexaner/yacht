@@ -237,6 +237,71 @@ func TestCreated_Missing(t *testing.T) {
 	}
 }
 
+// TestCreated_TrimsBaseURLTrailingSlash: an operator who sets BASE_URL with a
+// trailing slash (BASE_URL=https://send.example.com/) must not get a
+// double-slashed share URL on the confirmation page. Mirrors the bot's
+// TrimsBaseURLTrailingSlash regression so both surfaces stay consistent.
+func TestCreated_TrimsBaseURLTrailingSlash(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "created.db")
+	handle, err := db.New(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	t.Cleanup(func() { handle.Close() })
+	if _, err := db.Migrate(ctx, handle); err != nil {
+		t.Fatalf("db.Migrate: %v", err)
+	}
+	backend, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	shared := &config.Shared{
+		BaseURL:        "https://send.example.com/",
+		DefaultExpiry:  24 * time.Hour,
+		MaxUploadBytes: 1024 * 1024,
+	}
+	svc := share.New(handle, backend, shared)
+	cfg := &config.Web{
+		Shared:            shared,
+		SessionCookieName: "yacht_session",
+		SessionLifetime:   30 * 24 * time.Hour,
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv, err := New(cfg, handle, svc, nil, nil, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	userID := insertCreatedTestAdmin(t, handle, 1)
+	sessionID := uploadTestSession(t, handle, userID)
+	sh, err := svc.CreateTextShare(context.Background(), share.CreateTextOpts{
+		UserID:  userID,
+		Content: "hi",
+		Expiry:  time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("CreateTextShare: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/shares/"+sh.ID+"/created", nil)
+	req.AddCookie(&http.Cookie{Name: "yacht_session", Value: sessionID})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	want := "https://send.example.com/" + sh.ID
+	if !strings.Contains(body, want) {
+		t.Errorf("body missing single-slash share URL %q; got:\n%s", want, body)
+	}
+	if strings.Contains(body, "https://send.example.com//") {
+		t.Errorf("body contains double-slash share URL; got:\n%s", body)
+	}
+}
+
 // TestCreated_Expired: a share whose expires_at has already passed maps to
 // 410 Gone — the row exists, but the share is dead. Same mapping as the
 // public share page; the operator's POV after their share has lapsed is

@@ -94,7 +94,7 @@ func TestHome_RendersForAuthenticatedUser(t *testing.T) {
 		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Logged in", "Ada Lovelace", `action="/logout"`} {
+	for _, want := range []string{"Logged in", "Ada Lovelace", `action="/logout"`, `href="/upload"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q; got:\n%s", want, body)
 		}

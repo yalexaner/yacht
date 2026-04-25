@@ -186,6 +186,13 @@ func TestUploadForm_RendersForm(t *testing.T) {
 	if !strings.Contains(body, `value="86400" selected`) {
 		t.Errorf("body missing pre-selected 24h option; got:\n%s", body)
 	}
+	// both size hints must render so the operator sees the right cap before
+	// they hit it — text rides the per-field cap, files ride MaxUploadBytes.
+	for _, want := range []string{"Maximum file size:", "Maximum text size:"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing size hint %q; got:\n%s", want, body)
+		}
+	}
 }
 
 // TestUploadForm_FieldOrder pins the load-bearing order from decision #2:
@@ -442,6 +449,61 @@ func TestParseUploadForm_FileStripsDirectoryPrefix(t *testing.T) {
 	}
 	if fields.Filename != "report.pdf" {
 		t.Errorf("Filename: want basename %q, got %q", "report.pdf", fields.Filename)
+	}
+}
+
+// TestParseUploadForm_FileStripsWindowsBackslashPath: a Windows-style path
+// (e.g. "C:\fakepath\report.pdf" — what older Edge / certain mobile webviews
+// still send) must be stripped to its basename. filepath.Base on Linux/macOS
+// only treats "/" as a separator, so without the explicit backslash
+// normalisation in the parser the bogus drive prefix would land in
+// OriginalFilename and leak into the download Content-Disposition.
+func TestParseUploadForm_FileStripsWindowsBackslashPath(t *testing.T) {
+	req := newUploadParseRequest(t, uploadFormSpec{
+		Kind:   strPtr("file"),
+		Expiry: strPtr("86400"),
+		File: &uploadFileSpec{
+			Filename:    `C:\fakepath\report.pdf`,
+			ContentType: "application/pdf",
+			Content:     []byte("x"),
+		},
+	})
+
+	fields, err := parseUploadForm(req, 1024*1024)
+	if err != nil {
+		t.Fatalf("parseUploadForm: %v", err)
+	}
+	if fields.Filename != "report.pdf" {
+		t.Errorf("Filename: want basename %q, got %q", "report.pdf", fields.Filename)
+	}
+}
+
+// TestParseUploadForm_FieldOverflowRejected: a non-file field whose value
+// exceeds the 64 KB per-field cap must reject loud rather than silently
+// truncate. io.LimitReader returns io.EOF at the cap with no error from
+// io.ReadAll, so a naive read would have silently kept only the first 64 KB
+// of a 200 KB pasted text — the parser reads cap+1 and rejects on overflow
+// to surface the cap mismatch instead of letting it through. For the text
+// field specifically the error must wrap errTextTooLarge so the handler can
+// surface a size-aware banner instead of the catch-all parse message.
+func TestParseUploadForm_FieldOverflowRejected(t *testing.T) {
+	bigText := strings.Repeat("a", uploadFieldMaxBytes+1)
+
+	req := newUploadParseRequest(t, uploadFormSpec{
+		Kind:   strPtr("text"),
+		Expiry: strPtr("86400"),
+		Text:   strPtr(bigText),
+	})
+
+	_, err := parseUploadForm(req, 1024*1024)
+	if err == nil {
+		t.Fatalf("parseUploadForm: want error on oversized field, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("error: want 'exceeds' substring, got %v", err)
+	}
+	if !errors.Is(err, errTextTooLarge) {
+		t.Errorf("error: want errors.Is errTextTooLarge, got %v", err)
 	}
 }
 
@@ -1071,5 +1133,90 @@ func TestUploadSubmit_TooLarge(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("shares table: want 0 rows on too-large submission, got %d", count)
+	}
+}
+
+// TestUploadSubmit_TooLarge_FileSpool covers the second MaxBytesError branch
+// inside uploadSubmitHandler: parseUploadForm completes (non-file fields fit
+// under the cap), but the file payload itself overflows during the spool
+// io.Copy in createFileShareFromPart. The test pins the same friendly 413
+// + form re-render mapping the parse-stage path produces, so a refactor that
+// drops the second errors.As cannot land silently.
+func TestUploadSubmit_TooLarge_FileSpool(t *testing.T) {
+	srv, _, handle := newUploadTestServerWithService(t, 512)
+	userID := insertUploadTestAdmin(t, handle)
+	sessionID := uploadTestSession(t, handle, userID)
+
+	bigFile := bytes.Repeat([]byte("x"), 200*1024)
+	req := newAuthedUploadRequest(t, sessionID, uploadFormSpec{
+		Kind:   strPtr("file"),
+		Expiry: strPtr("86400"),
+		File: &uploadFileSpec{
+			Filename:    "huge.bin",
+			ContentType: "application/octet-stream",
+			Content:     bigFile,
+		},
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: want 413, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "too large") {
+		t.Errorf("body missing 'too large' message; got:\n%s", body)
+	}
+	if !strings.Contains(body, `action="/upload"`) {
+		t.Errorf("body missing re-rendered upload form; got:\n%s", body)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM shares`).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("shares table: want 0 rows on too-large file submission, got %d", count)
+	}
+}
+
+// TestUploadSubmit_TextOverflow covers the size-aware banner for the
+// per-field text cap. Pasted text between uploadFieldMaxBytes and
+// MaxUploadBytes does not trip MaxBytesReader (the body fits the request
+// cap) but does trip parseUploadForm's per-field cap. The handler must
+// surface the text-specific message (mentioning the text limit) instead of
+// the generic "could not process the form" line — pasting 100 KB and
+// getting a vague 400 was the friction the friendly banner exists to fix.
+func TestUploadSubmit_TextOverflow(t *testing.T) {
+	srv, _, handle := newUploadTestServerWithService(t, 1024*1024)
+	userID := insertUploadTestAdmin(t, handle)
+	sessionID := uploadTestSession(t, handle, userID)
+
+	bigText := strings.Repeat("a", uploadFieldMaxBytes+1)
+	req := newAuthedUploadRequest(t, sessionID, uploadFormSpec{
+		Kind:   strPtr("text"),
+		Expiry: strPtr("86400"),
+		Text:   strPtr(bigText),
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: want 413, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "text is too long") {
+		t.Errorf("body missing text-specific 'too long' message; got:\n%s", body)
+	}
+	if !strings.Contains(body, `action="/upload"`) {
+		t.Errorf("body missing re-rendered upload form; got:\n%s", body)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM shares`).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("shares table: want 0 rows on text-overflow submission, got %d", count)
 	}
 }

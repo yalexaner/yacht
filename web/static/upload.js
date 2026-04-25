@@ -21,26 +21,29 @@
     var textBlock = form.querySelector('.text-block');
     var fileBlock = form.querySelector('.file-block');
     var textInput = form.querySelector('textarea[name="text"]');
-    var fileInput = form.querySelector('input[name="file"]');
+    var fileInput = form.querySelector('input[type="file"][name="file"]');
     var kindRadios = form.querySelectorAll('input[name="kind"]');
 
-    // syncKindVisibility hides the input block that doesn't match the selected
-    // radio. The other block stays in the DOM so the form keeps posting both
-    // fields — parseUploadForm tolerates an empty file part on kind=text and
-    // ignores text on kind=file, so visibility here is a UX hint, not a
-    // correctness gate.
+    // syncKindVisibility hides the inactive input block AND disables the
+    // input inside it. Disabling matters because the browser won't submit a
+    // disabled control: without it, an operator who picks a file then flips
+    // to kind=text still ships the file part, which parseUploadForm rejects
+    // as "text kind must not include a file part" — surfacing as a generic
+    // 400 from a perfectly normal UI flow. The mirror case (paste text, then
+    // flip to kind=file) is the same shape: a 64 KiB+ paste left in the
+    // textarea would trip the per-field cap. Disabling the inactive input
+    // preserves the operator's selection (the file/text stays put if they
+    // flip back) while keeping it out of the multipart body.
     function syncKindVisibility() {
       var selected = form.querySelector('input[name="kind"]:checked');
       if (!selected) {
         return;
       }
-      if (selected.value === 'file') {
-        if (fileBlock) fileBlock.hidden = false;
-        if (textBlock) textBlock.hidden = true;
-      } else {
-        if (fileBlock) fileBlock.hidden = true;
-        if (textBlock) textBlock.hidden = false;
-      }
+      var fileActive = selected.value === 'file';
+      if (fileBlock) fileBlock.hidden = !fileActive;
+      if (textBlock) textBlock.hidden = fileActive;
+      if (fileInput) fileInput.disabled = !fileActive;
+      if (textInput) textInput.disabled = fileActive;
     }
 
     for (var i = 0; i < kindRadios.length; i++) {
@@ -101,19 +104,12 @@
         if (progress) progress.hidden = true;
         if (percent) percent.hidden = true;
         var banner = document.createElement('p');
-        banner.className = 'error';
+        banner.className = 'form-error';
         banner.textContent = 'Upload failed — please check your connection and try again.';
         form.parentNode.insertBefore(banner, form);
       };
 
       xhr.send(formData);
     });
-
-    // Touching textInput / fileInput here keeps a couple of references the
-    // closure already captured "live" against future template tweaks — a
-    // dropped element shows up as a console-discoverable null instead of a
-    // silent no-op deep inside the submit path.
-    void textInput;
-    void fileInput;
   });
 })();

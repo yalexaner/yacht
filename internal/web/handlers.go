@@ -121,12 +121,15 @@ var expiryOptions = []expiryOption{
 // uploadFormView feeds upload.html. ExpiryOptions is the dropdown allowlist;
 // DefaultExpirySeconds picks the pre-selected option (matched against
 // cfg.DefaultExpiry); MaxUploadBytes is rendered as a human-readable cap so
-// the operator knows the limit before they pick a file. Error is the banner
-// shown above the form when a previous submission was rejected.
+// the operator knows the file limit before they pick one; MaxTextBytes does
+// the same for the textarea (different ceiling — text rides the per-field
+// cap, files ride MaxUploadBytes). Error is the banner shown above the
+// form when a previous submission was rejected.
 type uploadFormView struct {
 	ExpiryOptions        []expiryOption
 	DefaultExpirySeconds int64
 	MaxUploadBytes       int64
+	MaxTextBytes         int64
 	Error                string
 }
 
@@ -190,6 +193,7 @@ func (s *Server) uploadFormHandler(w http.ResponseWriter, r *http.Request) {
 		ExpiryOptions:        expiryOptions,
 		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
 		MaxUploadBytes:       s.cfg.MaxUploadBytes,
+		MaxTextBytes:         uploadFieldMaxBytes,
 	})
 }
 
@@ -204,6 +208,7 @@ func (s *Server) renderUploadForm(w http.ResponseWriter, status int, msg string)
 		ExpiryOptions:        expiryOptions,
 		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
 		MaxUploadBytes:       s.cfg.MaxUploadBytes,
+		MaxTextBytes:         uploadFieldMaxBytes,
 		Error:                msg,
 	})
 }
@@ -241,6 +246,14 @@ func (s *Server) uploadSubmitHandler(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &maxErr) {
 			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("That upload is too large — the limit is %s.", humanBytes(s.cfg.MaxUploadBytes)))
+			return
+		}
+		// Text-overflow gets its own banner so the operator knows which cap
+		// they hit (the text cap is far below MaxUploadBytes; surfacing the
+		// generic message would mislead).
+		if errors.Is(err, errTextTooLarge) {
+			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("That text is too long — the limit is %s.", humanBytes(uploadFieldMaxBytes)))
 			return
 		}
 		s.logger.Warn("parse upload form", "err", err)
@@ -322,8 +335,12 @@ func (s *Server) createdHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.render(w, http.StatusOK, "share_created.html", shareCreatedView{
-		ID:        sh.ID,
-		ShareURL:  s.cfg.BaseURL + "/" + sh.ID,
+		ID: sh.ID,
+		// TrimRight normalises a trailing slash on BaseURL so an operator
+		// setting BASE_URL=https://example.com/ doesn't produce a
+		// double-slashed share URL. Same reasoning as the bot's
+		// buildShareReply (internal/bot/handlers.go).
+		ShareURL:  strings.TrimRight(s.cfg.BaseURL, "/") + "/" + sh.ID,
 		Kind:      sh.Kind,
 		Filename:  stringOrEmpty(sh.OriginalFilename),
 		Size:      int64OrZero(sh.SizeBytes),
@@ -395,8 +412,18 @@ func defaultExpirySeconds(d time.Duration) int64 {
 // 64 KB cap is generous for a paste-into-text-area share while still small
 // enough that a malformed client streaming gigabytes into one field can't
 // exhaust process memory. The same constant is the per-field LimitReader
-// guard inside parseUploadForm.
+// guard inside parseUploadForm and is surfaced to the upload form as the
+// text-share content cap so the operator sees an actionable limit before
+// they hit it.
 const uploadFieldMaxBytes = 64 * 1024
+
+// errTextTooLarge is returned (wrapped) by parseUploadForm when the text
+// field overflows uploadFieldMaxBytes. Distinct from the generic field-
+// overflow path so the handler can render the size-specific friendly banner
+// (mentioning the text cap) instead of the catch-all "could not process"
+// message — text is the only non-file field a normal operator can drive
+// over the cap by hand. Match with errors.Is.
+var errTextTooLarge = errors.New("upload: text content exceeds limit")
 
 // uploadFields is the parsed projection of a POST /upload multipart body.
 // File is non-nil for kind=file and the caller is expected to stream from it
@@ -484,12 +511,15 @@ func parseUploadForm(r *http.Request, maxBytes int64) (uploadFields, error) {
 		name := part.FormName()
 		if name == "file" {
 			// File part — capture filename/MIME and hand the reader to the
-			// caller. filepath.Base strips any leading directory segments a
-			// browser might prepend on certain platforms, and an empty
-			// result (no file selected — common when the kind=text radio is
-			// active but the file <input> still ships with the form) is
-			// treated as "no file" so trailing fields after it still parse.
-			filename := filepath.Base(part.FileName())
+			// caller. ReplaceAll normalises Windows-style backslash paths
+			// (e.g. "C:\fakepath\report.pdf" from older Edge / certain
+			// mobile webviews) so filepath.Base — which only treats "/" as
+			// a separator on Linux/macOS — still strips the bogus prefix
+			// instead of letting it land in OriginalFilename. An empty
+			// result (no file selected — common when the kind=text radio
+			// is active but the file <input> still ships with the form)
+			// is treated as "no file" so trailing fields after it still parse.
+			filename := filepath.Base(strings.ReplaceAll(part.FileName(), `\`, "/"))
 			if filename == "" || filename == "." || filename == "/" {
 				_ = part.Close()
 				continue
@@ -509,13 +539,27 @@ func parseUploadForm(r *http.Request, maxBytes int64) (uploadFields, error) {
 			break
 		}
 
-		// Non-file field. LimitReader caps how much we'll buffer per field
-		// before giving up; an oversized field rolls up into the
-		// MaxBytesReader cap above when the parser advances past it.
-		buf, err := io.ReadAll(io.LimitReader(part, uploadFieldMaxBytes))
+		// Non-file field. We read up to uploadFieldMaxBytes+1 so an oversized
+		// field is reliably detected: io.LimitReader returns io.EOF when the
+		// cap is hit and io.ReadAll then returns no error, so reading exactly
+		// uploadFieldMaxBytes would silently truncate. Reading one extra byte
+		// lets us notice the overflow and reject — otherwise a 200 KB pasted
+		// text would land as the first 64 KB with no warning.
+		buf, err := io.ReadAll(io.LimitReader(part, uploadFieldMaxBytes+1))
 		_ = part.Close()
 		if err != nil {
 			return uploadFields{}, fmt.Errorf("parse upload: read field %q: %w", name, err)
+		}
+		if int64(len(buf)) > uploadFieldMaxBytes {
+			// Tag the text-field overflow with errTextTooLarge so the handler
+			// can render the size-aware banner. Other field overflows
+			// (kind/password/expiry) still surface as the generic parse error
+			// — those fields aren't operator-typed at scale, so an oversize
+			// is a malformed-client signal worth keeping generic.
+			if name == "text" {
+				return uploadFields{}, fmt.Errorf("parse upload: field %q exceeds %d-byte cap: %w", name, uploadFieldMaxBytes, errTextTooLarge)
+			}
+			return uploadFields{}, fmt.Errorf("parse upload: field %q exceeds %d-byte cap", name, uploadFieldMaxBytes)
 		}
 
 		switch name {
@@ -542,7 +586,7 @@ func parseUploadForm(r *http.Request, maxBytes int64) (uploadFields, error) {
 		// that lands ahead of a corresponding server change shouldn't 400.
 	}
 
-	if fields.Kind != "file" && fields.Kind != "text" {
+	if fields.Kind != share.KindFile && fields.Kind != share.KindText {
 		return uploadFields{}, fmt.Errorf("parse upload: invalid kind %q", fields.Kind)
 	}
 	if !expirySet {
@@ -550,19 +594,16 @@ func parseUploadForm(r *http.Request, maxBytes int64) (uploadFields, error) {
 	}
 
 	switch fields.Kind {
-	case "text":
+	case share.KindText:
 		if fields.Text == "" {
 			return uploadFields{}, fmt.Errorf("parse upload: text content is empty")
 		}
 		if fields.File != nil {
 			return uploadFields{}, fmt.Errorf("parse upload: text kind must not include a file part")
 		}
-	case "file":
+	case share.KindFile:
 		if fields.File == nil {
 			return uploadFields{}, fmt.Errorf("parse upload: file kind requires a file part")
-		}
-		if fields.Filename == "" {
-			return uploadFields{}, fmt.Errorf("parse upload: file kind requires a non-empty filename")
 		}
 	}
 

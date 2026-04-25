@@ -81,7 +81,10 @@ progress {
 #copy-btn.copied {
   background: #2ea44f;
 }
-.error {
+/* form-error is the upload-form banner. Its own class — separate from
+   .error above — so the lighter inline styling on login/password pages
+   keeps working without the boxed banner treatment. */
+.form-error {
   color: #cb2431;
   background: #ffeef0;
   border: 1px solid #ffc1c8;
