@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -175,6 +176,137 @@ func (s *Server) uploadFormHandler(w http.ResponseWriter, r *http.Request) {
 		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
 		MaxUploadBytes:       s.cfg.MaxUploadBytes,
 	})
+}
+
+// renderUploadForm re-renders upload.html with an error banner. Used on
+// every parse / validation / size failure so the operator sees the form
+// they just submitted come back with a message above it instead of being
+// bounced to the generic error template — losing their intent in the
+// process. Pulled out of the handler so the various failure branches share
+// a single render call site.
+func (s *Server) renderUploadForm(w http.ResponseWriter, status int, msg string) {
+	s.render(w, status, "upload.html", uploadFormView{
+		ExpiryOptions:        expiryOptions,
+		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
+		MaxUploadBytes:       s.cfg.MaxUploadBytes,
+		Error:                msg,
+	})
+}
+
+// uploadSubmitHandler serves POST /upload: takes the parsed form, hands the
+// content to share.Service, and redirects to the created-confirmation page.
+// Wired behind RequireAuth at the mux, so user is guaranteed present —
+// the defensive miss-branch covers a routing regression that ever lets the
+// handler run without the gate.
+//
+// File-size handling (Phase 10 plan, Technical Details): multipart.Part
+// carries no per-part Content-Length, and storage backends — R2 in
+// particular — require ContentLength up front. We spool the file part to a
+// temp file via os.CreateTemp, stat it for size, then re-open and stream
+// from disk into share.CreateFileShare. The MaxBytesReader wrap inside
+// parseUploadForm bounds the spool to MaxUploadBytes + headroom, so a
+// hostile client can't exhaust local disk on this step. Costs one extra
+// disk pass per upload; at personal scale and the 100 MB cap the trade-off
+// is correct robustness over the streaming-purity alternative.
+//
+// Failure routing: parse / validation errors and oversized bodies
+// re-render upload.html with an Error banner so the operator's intent is
+// preserved. Anything else (DB or storage fault) is an internal failure
+// and gets the shared error template at 500.
+func (s *Server) uploadSubmitHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	fields, err := parseUploadForm(r, s.cfg.MaxUploadBytes)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("That upload is too large — the limit is %s.", humanBytes(s.cfg.MaxUploadBytes)))
+			return
+		}
+		s.logger.Warn("parse upload form", "err", err)
+		s.renderUploadForm(w, http.StatusBadRequest,
+			"We could not process the form. Please check your inputs and try again.")
+		return
+	}
+
+	var sh *share.Share
+	switch fields.Kind {
+	case share.KindText:
+		sh, err = s.share.CreateTextShare(r.Context(), share.CreateTextOpts{
+			UserID:   user.ID,
+			Content:  fields.Text,
+			Password: fields.Password,
+			Expiry:   fields.Expiry,
+		})
+	case share.KindFile:
+		sh, err = s.createFileShareFromPart(r, user.ID, fields)
+	}
+	if err != nil {
+		// MaxBytesError can surface during the spool step too — fields parsed
+		// fine, but the file part itself overflowed. Map to the same friendly
+		// 413 page rather than the generic 500.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("That upload is too large — the limit is %s.", humanBytes(s.cfg.MaxUploadBytes)))
+			return
+		}
+		s.logger.Error("create share", "kind", fields.Kind, "user_id", user.ID, "err", err)
+		s.renderError(w, http.StatusInternalServerError, "Something went wrong",
+			"We could not create your share. Please try again.")
+		return
+	}
+
+	http.Redirect(w, r, "/shares/"+sh.ID+"/created", http.StatusSeeOther)
+}
+
+// createFileShareFromPart spools the file part to a temp file on disk so we
+// can stat it for size before handing it to share.CreateFileShare. The
+// storage interface (and the R2 backend in particular) requires
+// ContentLength up front, and multipart.Part doesn't expose one — buffering
+// to a temp file is the cheapest correct path that keeps the storage
+// contract uniform across backends. The temp file lives in the OS temp
+// directory and is removed regardless of success or failure.
+func (s *Server) createFileShareFromPart(r *http.Request, userID int64, fields uploadFields) (*share.Share, error) {
+	tmp, err := os.CreateTemp("", "yacht-upload-*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp upload file: %w", err)
+	}
+	tmpName := tmp.Name()
+	// belt-and-braces: close + remove on every exit. os.File.Close is safe
+	// to call twice (returns ErrClosed, ignored), and Remove on a missing
+	// path is harmless after a successful unlink elsewhere.
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	size, err := io.Copy(tmp, fields.File)
+	if err != nil {
+		return nil, fmt.Errorf("spool upload to temp: %w", err)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind upload temp: %w", err)
+	}
+
+	sh, err := s.share.CreateFileShare(r.Context(), share.CreateFileOpts{
+		UserID:           userID,
+		OriginalFilename: fields.Filename,
+		MIMEType:         fields.MIMEType,
+		Size:             size,
+		Content:          tmp,
+		Password:         fields.Password,
+		Expiry:           fields.Expiry,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create file share: %w", err)
+	}
+	return sh, nil
 }
 
 // defaultExpirySeconds picks the dropdown option that matches the configured

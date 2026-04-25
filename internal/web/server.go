@@ -127,6 +127,7 @@ func (s *Server) Routes() http.Handler {
 	// mint shares. The download/share-page routes below stay public so a
 	// recipient with a link can fetch without an account.
 	mux.Handle("GET /upload", s.RequireAuth()(http.HandlerFunc(s.uploadFormHandler)))
+	mux.Handle("POST /upload", s.RequireAuth()(http.HandlerFunc(s.uploadSubmitHandler)))
 
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)

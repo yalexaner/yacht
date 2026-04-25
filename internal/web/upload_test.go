@@ -20,15 +20,30 @@ import (
 	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
 	"github.com/yalexaner/yacht/internal/db"
+	"github.com/yalexaner/yacht/internal/share"
+	"github.com/yalexaner/yacht/internal/storage/local"
+	"golang.org/x/crypto/bcrypt"
 )
 
-// newUploadTestServer builds a Server backed by a real *sql.DB so the
-// RequireAuth gate the upload routes ride behind can resolve session
-// cookies. DefaultExpiry is fixed at 24h so the form's pre-selected option
-// is the canonical one; MaxUploadBytes is small enough that an oversized-body
-// regression test would catch a missing MaxBytesReader without churning real
-// megabytes through the recorder.
+// newUploadTestServer builds a Server backed by a real *sql.DB plus a real
+// local-storage-backed share.Service so the RequireAuth gate the upload
+// routes ride behind can resolve session cookies AND uploadSubmitHandler can
+// actually persist shares. DefaultExpiry is fixed at 24h so the form's
+// pre-selected option is the canonical one; MaxUploadBytes is small enough
+// that an oversized-body regression test would catch a missing
+// MaxBytesReader without churning real megabytes through the recorder.
 func newUploadTestServer(t *testing.T) (*Server, *sql.DB) {
+	t.Helper()
+	srv, _, handle := newUploadTestServerWithService(t, 1024*1024)
+	return srv, handle
+}
+
+// newUploadTestServerWithService is the full-stack flavour of
+// newUploadTestServer: same wiring, plus exposes the *share.Service so
+// submit-path tests can create or read shares directly. maxUpload lets a
+// caller dial the size cap down for the oversized-body test without
+// affecting the rest of the suite.
+func newUploadTestServerWithService(t *testing.T, maxUpload int64) (*Server, *share.Service, *sql.DB) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -42,21 +57,29 @@ func newUploadTestServer(t *testing.T) (*Server, *sql.DB) {
 		t.Fatalf("db.Migrate: %v", err)
 	}
 
+	backend, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+
+	shared := &config.Shared{
+		DefaultExpiry:  24 * time.Hour,
+		MaxUploadBytes: maxUpload,
+	}
+	svc := share.New(handle, backend, shared)
+
 	cfg := &config.Web{
-		Shared: &config.Shared{
-			DefaultExpiry:  24 * time.Hour,
-			MaxUploadBytes: 1024 * 1024,
-		},
+		Shared:            shared,
 		SessionCookieName: "yacht_session",
 		SessionLifetime:   30 * 24 * time.Hour,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	srv, err := New(cfg, handle, nil, nil, nil, logger)
+	srv, err := New(cfg, handle, svc, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return srv, handle
+	return srv, svc, handle
 }
 
 // insertUploadTestAdmin inserts an admin users row so CreateSession's
@@ -695,5 +718,309 @@ func TestDefaultExpirySeconds(t *testing.T) {
 				t.Errorf("defaultExpirySeconds(%v): want %d, got %d", tc.in, tc.want, got)
 			}
 		})
+	}
+}
+
+// newAuthedUploadRequest builds a POST /upload request carrying a multipart
+// body and a real session cookie, the shape uploadSubmitHandler tests use
+// to drive the full RequireAuth → handler flow.
+func newAuthedUploadRequest(t *testing.T, sessionID string, spec uploadFormSpec) *http.Request {
+	t.Helper()
+	body, ct := buildMultipartBody(t, spec)
+	req := httptest.NewRequest(http.MethodPost, "/upload", body)
+	req.Header.Set("Content-Type", ct)
+	req.AddCookie(&http.Cookie{Name: "yacht_session", Value: sessionID})
+	return req
+}
+
+// TestUploadSubmit_RequiresAuth: POST /upload without a session cookie must
+// 303-redirect to /login, with no share row created. RequireAuth is the only
+// gate keeping unauthenticated visitors from minting shares, so a routing
+// regression that drops it would silently open the upload path to the world.
+func TestUploadSubmit_RequiresAuth(t *testing.T) {
+	srv, _, handle := newUploadTestServerWithService(t, 1024*1024)
+
+	body, ct := buildMultipartBody(t, uploadFormSpec{
+		Kind:   strPtr("text"),
+		Expiry: strPtr("86400"),
+		Text:   strPtr("hello"),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/upload", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status: want 303, got %d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/login" {
+		t.Errorf("location: want %q, got %q", "/login", loc)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM shares`).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("shares table: want 0 rows after gated POST, got %d", count)
+	}
+}
+
+// TestUploadSubmit_TextHappyPath: a well-formed kind=text submission lands
+// a text share row with the submitted content, no password hash, and
+// 303-redirects to /shares/{id}/created. Pinning every load-bearing piece
+// means a refactor that breaks any one of them surfaces immediately.
+func TestUploadSubmit_TextHappyPath(t *testing.T) {
+	srv, svc, handle := newUploadTestServerWithService(t, 1024*1024)
+	userID := insertUploadTestAdmin(t, handle)
+	sessionID := uploadTestSession(t, handle, userID)
+
+	req := newAuthedUploadRequest(t, sessionID, uploadFormSpec{
+		Kind:     strPtr("text"),
+		Password: strPtr(""),
+		Expiry:   strPtr("86400"),
+		Text:     strPtr("a secret memo"),
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status: want 303, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/shares/") || !strings.HasSuffix(loc, "/created") {
+		t.Fatalf("location: want /shares/{id}/created, got %q", loc)
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(loc, "/shares/"), "/created")
+
+	sh, err := svc.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Get %q: %v", id, err)
+	}
+	if sh.Kind != "text" {
+		t.Errorf("Kind: want %q, got %q", "text", sh.Kind)
+	}
+	if sh.UserID != userID {
+		t.Errorf("UserID: want %d, got %d", userID, sh.UserID)
+	}
+	if sh.TextContent == nil || *sh.TextContent != "a secret memo" {
+		t.Errorf("TextContent: want %q, got %v", "a secret memo", sh.TextContent)
+	}
+	if sh.PasswordHash != nil {
+		t.Errorf("PasswordHash: want nil for empty password, got %q", *sh.PasswordHash)
+	}
+}
+
+// TestUploadSubmit_FileHappyPath: a well-formed kind=file submission lands
+// a file share row with the storage object actually populated by the
+// submitted bytes. The redirect target follows the same /shares/{id}/created
+// shape as the text path, and OpenContent's reader streams the exact payload.
+func TestUploadSubmit_FileHappyPath(t *testing.T) {
+	srv, svc, handle := newUploadTestServerWithService(t, 1024*1024)
+	userID := insertUploadTestAdmin(t, handle)
+	sessionID := uploadTestSession(t, handle, userID)
+
+	payload := []byte("file payload bytes")
+	req := newAuthedUploadRequest(t, sessionID, uploadFormSpec{
+		Kind:     strPtr("file"),
+		Password: strPtr(""),
+		Expiry:   strPtr("3600"),
+		File: &uploadFileSpec{
+			Filename:    "report.pdf",
+			ContentType: "application/pdf",
+			Content:     payload,
+		},
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status: want 303, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/shares/") || !strings.HasSuffix(loc, "/created") {
+		t.Fatalf("location: want /shares/{id}/created, got %q", loc)
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(loc, "/shares/"), "/created")
+
+	sh, err := svc.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Get %q: %v", id, err)
+	}
+	if sh.Kind != "file" {
+		t.Errorf("Kind: want %q, got %q", "file", sh.Kind)
+	}
+	if sh.OriginalFilename == nil || *sh.OriginalFilename != "report.pdf" {
+		t.Errorf("OriginalFilename: want %q, got %v", "report.pdf", sh.OriginalFilename)
+	}
+	if sh.MIMEType == nil || *sh.MIMEType != "application/pdf" {
+		t.Errorf("MIMEType: want %q, got %v", "application/pdf", sh.MIMEType)
+	}
+	if sh.SizeBytes == nil || *sh.SizeBytes != int64(len(payload)) {
+		t.Errorf("SizeBytes: want %d, got %v", len(payload), sh.SizeBytes)
+	}
+	if sh.PasswordHash != nil {
+		t.Errorf("PasswordHash: want nil for empty password, got %q", *sh.PasswordHash)
+	}
+
+	rc, err := svc.OpenContent(context.Background(), sh)
+	if err != nil {
+		t.Fatalf("OpenContent: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read storage object: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("storage bytes: want %q, got %q", payload, got)
+	}
+}
+
+// TestUploadSubmit_WithPassword: setting a password on either kind must
+// land a real bcrypt hash on the row — not the plaintext, not a no-op.
+// CompareHashAndPassword is the authoritative check that the hash matches
+// the original input, regardless of cost or algorithm changes downstream.
+func TestUploadSubmit_WithPassword(t *testing.T) {
+	cases := []struct {
+		name string
+		spec uploadFormSpec
+	}{
+		{
+			name: "text",
+			spec: uploadFormSpec{
+				Kind:     strPtr("text"),
+				Password: strPtr("hunter2"),
+				Expiry:   strPtr("86400"),
+				Text:     strPtr("private note"),
+			},
+		},
+		{
+			name: "file",
+			spec: uploadFormSpec{
+				Kind:     strPtr("file"),
+				Password: strPtr("hunter2"),
+				Expiry:   strPtr("86400"),
+				File: &uploadFileSpec{
+					Filename:    "secret.bin",
+					ContentType: "application/octet-stream",
+					Content:     []byte{1, 2, 3},
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, svc, handle := newUploadTestServerWithService(t, 1024*1024)
+			userID := insertUploadTestAdmin(t, handle)
+			sessionID := uploadTestSession(t, handle, userID)
+
+			req := newAuthedUploadRequest(t, sessionID, tc.spec)
+			rec := httptest.NewRecorder()
+			srv.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusSeeOther {
+				t.Fatalf("status: want 303, got %d; body=%q", rec.Code, rec.Body.String())
+			}
+			loc := rec.Header().Get("Location")
+			id := strings.TrimSuffix(strings.TrimPrefix(loc, "/shares/"), "/created")
+
+			sh, err := svc.Get(context.Background(), id)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if sh.PasswordHash == nil {
+				t.Fatalf("PasswordHash: want non-nil for kind=%s with password set", tc.name)
+			}
+			if *sh.PasswordHash == "hunter2" {
+				t.Errorf("PasswordHash: stored plaintext instead of bcrypt hash")
+			}
+			if err := bcrypt.CompareHashAndPassword([]byte(*sh.PasswordHash), []byte("hunter2")); err != nil {
+				t.Errorf("CompareHashAndPassword: %v", err)
+			}
+		})
+	}
+}
+
+// TestUploadSubmit_ValidationFailureRendersForm: a parse / validation
+// failure (here: an expiry value not on the allowlist) must re-render
+// upload.html with an Error banner at status 400 — not 500, not a redirect
+// to a generic error page. The operator's intent should be preserved so
+// they can fix the field and resubmit.
+func TestUploadSubmit_ValidationFailureRendersForm(t *testing.T) {
+	srv, _, handle := newUploadTestServerWithService(t, 1024*1024)
+	userID := insertUploadTestAdmin(t, handle)
+	sessionID := uploadTestSession(t, handle, userID)
+
+	req := newAuthedUploadRequest(t, sessionID, uploadFormSpec{
+		Kind:   strPtr("text"),
+		Expiry: strPtr("99999"),
+		Text:   strPtr("hello"),
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`action="/upload"`,
+		`enctype="multipart/form-data"`,
+		`name="kind"`,
+		`name="expiry"`,
+		"could not process",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q; got:\n%s", want, body)
+		}
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM shares`).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("shares table: want 0 rows on validation failure, got %d", count)
+	}
+}
+
+// TestUploadSubmit_TooLarge: a body exceeding MaxUploadBytes + headroom
+// must surface as a friendly 413 with the upload form re-rendered, not a
+// generic 500 or a hung connection. MaxBytesReader trips on read inside
+// parseUploadForm; the handler errors.As-matches and routes to the
+// dedicated "too large" page. Setting MaxUploadBytes to 1 here keeps the
+// test payload manageable while still tripping the cap with room to spare.
+func TestUploadSubmit_TooLarge(t *testing.T) {
+	srv, _, handle := newUploadTestServerWithService(t, 1)
+	userID := insertUploadTestAdmin(t, handle)
+	sessionID := uploadTestSession(t, handle, userID)
+
+	bigText := strings.Repeat("a", 128*1024)
+	req := newAuthedUploadRequest(t, sessionID, uploadFormSpec{
+		Kind:   strPtr("text"),
+		Expiry: strPtr("86400"),
+		Text:   strPtr(bigText),
+	})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status: want 413, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "too large") {
+		t.Errorf("body missing 'too large' message; got:\n%s", body)
+	}
+	if !strings.Contains(body, `action="/upload"`) {
+		t.Errorf("body missing re-rendered upload form; got:\n%s", body)
+	}
+
+	var count int
+	if err := handle.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM shares`).Scan(&count); err != nil {
+		t.Fatalf("count shares: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("shares table: want 0 rows on too-large submission, got %d", count)
 	}
 }
