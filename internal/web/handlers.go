@@ -89,6 +89,43 @@ type loginView struct {
 	Error       string
 }
 
+// expiryOption is one entry in the upload form's "Expires after" dropdown.
+// Seconds is what the form posts back; Label is what the operator sees.
+// Stored as int64 (not time.Duration) because the form value is a string of
+// decimal seconds — keeping the same units on both sides means the template
+// renders raw integers and the server parses them with strconv.ParseInt
+// without a unit conversion in the middle.
+type expiryOption struct {
+	Label   string
+	Seconds int64
+}
+
+// expiryOptions is the allowlist of expiry durations the upload form offers
+// (Phase 10 plan, decision #5). The POST handler validates the submitted
+// `expiry` field against the Seconds values in this slice — anything outside
+// the list is rejected. Keeping the list in code (not config) means a future
+// "1 year" option needs a deliberate code change rather than a stray env var.
+var expiryOptions = []expiryOption{
+	{Label: "1 hour", Seconds: 3600},
+	{Label: "6 hours", Seconds: 21600},
+	{Label: "24 hours", Seconds: 86400},
+	{Label: "3 days", Seconds: 259200},
+	{Label: "7 days", Seconds: 604800},
+	{Label: "30 days", Seconds: 2592000},
+}
+
+// uploadFormView feeds upload.html. ExpiryOptions is the dropdown allowlist;
+// DefaultExpirySeconds picks the pre-selected option (matched against
+// cfg.DefaultExpiry); MaxUploadBytes is rendered as a human-readable cap so
+// the operator knows the limit before they pick a file. Error is the banner
+// shown above the form when a previous submission was rejected.
+type uploadFormView struct {
+	ExpiryOptions        []expiryOption
+	DefaultExpirySeconds int64
+	MaxUploadBytes       int64
+	Error                string
+}
+
 // loginErrorMessages maps ?error= query codes produced by the auth handlers
 // (Tasks 7-9) to human-readable messages. Unknown codes resolve to an empty
 // string so an attacker cannot inject arbitrary text through the query
@@ -120,6 +157,36 @@ func (s *Server) homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, http.StatusOK, "home.html", homeView{DisplayName: user.DisplayName})
+}
+
+// uploadFormHandler serves GET /upload: the upload form. Wired behind
+// RequireAuth at the mux, so by the time we get here the request carries a
+// hydrated *auth.User in its context — an unauthed visitor was already
+// bounced to /login. The view model carries the allowlist dropdown options,
+// the pre-selected default (matched against cfg.DefaultExpiry, falling back
+// to 24h when the configured default doesn't appear in the list), and the
+// upload size cap so the template can show it humanized.
+func (s *Server) uploadFormHandler(w http.ResponseWriter, r *http.Request) {
+	s.render(w, http.StatusOK, "upload.html", uploadFormView{
+		ExpiryOptions:        expiryOptions,
+		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
+		MaxUploadBytes:       s.cfg.MaxUploadBytes,
+	})
+}
+
+// defaultExpirySeconds picks the dropdown option that matches the configured
+// DefaultExpiry. Falls back to 24h (the documented service default) when the
+// configured value isn't on the allowlist — a misconfigured default
+// shouldn't make the form unselectable. Pure helper so the upload-form tests
+// can verify the selection logic without touching templates.
+func defaultExpirySeconds(d time.Duration) int64 {
+	want := int64(d.Seconds())
+	for _, opt := range expiryOptions {
+		if opt.Seconds == want {
+			return opt.Seconds
+		}
+	}
+	return 86400
 }
 
 // loginHandler serves GET /login: the login page with the Telegram Login

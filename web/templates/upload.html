@@ -1,0 +1,50 @@
+{{define "title"}}Upload — yacht{{end}}
+{{define "content"}}
+<h1>Create a share</h1>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+<form method="post" action="/upload" enctype="multipart/form-data">
+  {{/*
+    Field order is load-bearing (Phase 10 plan, decision #2). Non-file fields
+    must precede the file <input> so they arrive first in the multipart
+    stream — the server reads metadata up front, then hands the file part
+    straight to the share service without buffering. Re-ordering this form
+    silently breaks streamed file uploads.
+  */}}
+  <fieldset class="kind-group">
+    <legend>Share type</legend>
+    <label><input type="radio" name="kind" value="file" checked> File</label>
+    <label><input type="radio" name="kind" value="text"> Text</label>
+  </fieldset>
+
+  <label>
+    Password (optional)
+    <input type="password" name="password" autocomplete="new-password">
+  </label>
+
+  <label>
+    Expires after
+    <select name="expiry">
+      {{range .ExpiryOptions}}
+      <option value="{{.Seconds}}"{{if eq .Seconds $.DefaultExpirySeconds}} selected{{end}}>{{.Label}}</option>
+      {{end}}
+    </select>
+  </label>
+
+  <label class="text-block">
+    Text content
+    <textarea name="text" rows="6"></textarea>
+  </label>
+
+  <label class="file-block">
+    File
+    <input type="file" name="file">
+  </label>
+
+  <p class="muted">Maximum upload size: {{humanBytes .MaxUploadBytes}}.</p>
+
+  <progress id="upload-progress" max="100" value="0" hidden></progress>
+  <span id="upload-percent" hidden></span>
+
+  <button type="submit">Create share</button>
+</form>
+{{end}}
