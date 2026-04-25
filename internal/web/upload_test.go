@@ -985,6 +985,31 @@ func TestUploadSubmit_ValidationFailureRendersForm(t *testing.T) {
 	}
 }
 
+// TestUpload_StaticAssets: GET /static/upload.js must serve the embedded
+// progress-bar / radio-toggle script with a JavaScript MIME type. The
+// upload form references the file via <script src="/static/upload.js"> in
+// the template, so a missing asset would silently break the JS-enhanced
+// submit path without any unit-test coverage of the underlying handler.
+// Substring-match on "javascript" covers both text/javascript and
+// application/javascript in case a future Go release flips the default.
+func TestUpload_StaticAssets(t *testing.T) {
+	srv, _ := newUploadTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/static/upload.js", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Errorf("content-type: want javascript MIME, got %q", ct)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "XMLHttpRequest") {
+		t.Errorf("body: want XHR-driven script, got:\n%s", body)
+	}
+}
+
 // TestUploadSubmit_TooLarge: a body exceeding MaxUploadBytes + headroom
 // must surface as a friendly 413 with the upload form re-rendered, not a
 // generic 500 or a hung connection. MaxBytesReader trips on read inside

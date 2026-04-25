@@ -47,4 +47,11 @@
 
   <button type="submit">Create share</button>
 </form>
+{{/*
+  upload.js is purely additive: it intercepts the submit to drive a progress
+  bar, and toggles the file/text input blocks based on the kind radio. The
+  form still works with JS disabled — the browser falls back to a regular
+  multipart POST and the handler 303-redirects to the created page.
+*/}}
+<script src="/static/upload.js" defer></script>
 {{end}}
