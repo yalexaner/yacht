@@ -17,4 +17,10 @@
 <p class="meta">Expires at {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
 
 <p><a class="btn" href="/upload">Create another share</a></p>
+{{/*
+  copy.js binds [data-copy-text] elements to clipboard writes with a
+  legacy execCommand fallback for non-secure contexts. Loaded with defer
+  so the button is in the DOM by the time the script runs.
+*/}}
+<script src="/static/copy.js" defer></script>
 {{end}}

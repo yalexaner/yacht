@@ -1010,6 +1010,30 @@ func TestUpload_StaticAssets(t *testing.T) {
 	}
 }
 
+// TestStatic_ServesCopyJS: GET /static/copy.js must serve the embedded
+// clipboard helper with a JavaScript MIME type. share_created.html loads
+// the file via <script src="/static/copy.js">, so a missing asset would
+// silently disable the Copy button without any direct handler coverage.
+// The substring check on "clipboard" pins the served body to the actual
+// helper rather than just any javascript file.
+func TestStatic_ServesCopyJS(t *testing.T) {
+	srv, _ := newUploadTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/static/copy.js", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Errorf("content-type: want javascript MIME, got %q", ct)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "clipboard") {
+		t.Errorf("body: want clipboard helper, got:\n%s", body)
+	}
+}
+
 // TestUploadSubmit_TooLarge: a body exceeding MaxUploadBytes + headroom
 // must surface as a friendly 413 with the upload form re-rendered, not a
 // generic 500 or a hung connection. MaxBytesReader trips on read inside
