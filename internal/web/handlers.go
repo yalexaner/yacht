@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yalexaner/yacht/internal/auth"
@@ -187,6 +190,185 @@ func defaultExpirySeconds(d time.Duration) int64 {
 		}
 	}
 	return 86400
+}
+
+// uploadFieldMaxBytes caps each non-file form field at 64 KB. The four such
+// fields (kind, password, expiry, text) all carry short string values; a
+// 64 KB cap is generous for a paste-into-text-area share while still small
+// enough that a malformed client streaming gigabytes into one field can't
+// exhaust process memory. The same constant is the per-field LimitReader
+// guard inside parseUploadForm.
+const uploadFieldMaxBytes = 64 * 1024
+
+// uploadFields is the parsed projection of a POST /upload multipart body.
+// File is non-nil for kind=file and the caller is expected to stream from it
+// straight into share.CreateFileShare without buffering — the underlying
+// part is held open by the active multipart reader, which in turn is held
+// open by the request body. Filename + MIMEType are pulled from the file
+// part's Content-Disposition / Content-Type headers; for kind=text both are
+// empty.
+type uploadFields struct {
+	Kind     string
+	Password string
+	Expiry   time.Duration
+	Text     string
+	File     *multipart.Part
+	Filename string
+	MIMEType string
+}
+
+// allowedExpiry maps a submitted expiry value (in seconds) to a Duration if
+// the value is on the form's allowlist. Returning a (Duration, ok) pair —
+// rather than a sentinel error — keeps the validation surface inside
+// parseUploadForm uniform: every "field rejected" path produces the same
+// shape of wrapped error there.
+func allowedExpiry(seconds int64) (time.Duration, bool) {
+	for _, opt := range expiryOptions {
+		if opt.Seconds == seconds {
+			return time.Duration(seconds) * time.Second, true
+		}
+	}
+	return 0, false
+}
+
+// parseUploadForm streams the POST /upload multipart body part-by-part and
+// returns the parsed metadata + a still-open file part for the caller to
+// stream into share.CreateFileShare. Splitting parsing out of the handler
+// (a) keeps the validation rules unit-testable without spinning a fake
+// share.Service and (b) draws the line between "this request is shaped
+// correctly" and "this request creates a share" so the handler's success
+// path stays a straight read.
+//
+// The body is wrapped with http.MaxBytesReader at maxBytes + 64 KB headroom
+// so an oversized upload fails on read with *http.MaxBytesError instead of
+// pulling unbounded bytes through the parser. The 64 KB headroom covers the
+// non-file form fields plus multipart boundaries — the share's payload
+// itself counts against maxBytes proper.
+//
+// Field-order assumption (Phase 10 plan, decision #2): the file part is the
+// last part in the stream. The form template enforces this in HTML; here we
+// stop iterating the moment we see the file part and hand the still-open
+// reader to the caller. Anything that arrives after a file part is silently
+// ignored — a deliberate choice so a buggy client that re-orders fields
+// fails closed (missing kind/expiry → validation error) rather than
+// half-succeeding with whichever fields landed before the file.
+//
+// Empty file inputs (no file selected — browsers still send a part with
+// empty filename) are skipped: parsing continues so the trailing fields
+// after an empty file input still land. This matters when a user with the
+// kind=text radio active still has the file <input> element inside the form
+// — the browser submits both, and we want validation to land on
+// kind/text checks rather than tripping on an empty file part.
+func parseUploadForm(r *http.Request, maxBytes int64) (uploadFields, error) {
+	// MaxBytesReader's first arg is the ResponseWriter it would otherwise
+	// add a Connection: close header to on overflow; nil is safe here and
+	// keeps the helper independent of the response writer so tests can
+	// drive it from a bare *http.Request.
+	r.Body = http.MaxBytesReader(nil, r.Body, maxBytes+uploadFieldMaxBytes)
+
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return uploadFields{}, fmt.Errorf("parse upload: read multipart: %w", err)
+	}
+
+	var fields uploadFields
+	expirySet := false
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return uploadFields{}, fmt.Errorf("parse upload: next part: %w", err)
+		}
+
+		name := part.FormName()
+		if name == "file" {
+			// File part — capture filename/MIME and hand the reader to the
+			// caller. filepath.Base strips any leading directory segments a
+			// browser might prepend on certain platforms, and an empty
+			// result (no file selected — common when the kind=text radio is
+			// active but the file <input> still ships with the form) is
+			// treated as "no file" so trailing fields after it still parse.
+			filename := filepath.Base(part.FileName())
+			if filename == "" || filename == "." || filename == "/" {
+				_ = part.Close()
+				continue
+			}
+			mime := part.Header.Get("Content-Type")
+			if mime == "" {
+				// Browsers usually populate Content-Type from the OS MIME
+				// guess, but a missing header is legal per RFC 7578.
+				// application/octet-stream is the spec's documented default
+				// and matches what http.DetectContentType returns for a
+				// stream with no recognizable signature.
+				mime = "application/octet-stream"
+			}
+			fields.File = part
+			fields.Filename = filename
+			fields.MIMEType = mime
+			break
+		}
+
+		// Non-file field. LimitReader caps how much we'll buffer per field
+		// before giving up; an oversized field rolls up into the
+		// MaxBytesReader cap above when the parser advances past it.
+		buf, err := io.ReadAll(io.LimitReader(part, uploadFieldMaxBytes))
+		_ = part.Close()
+		if err != nil {
+			return uploadFields{}, fmt.Errorf("parse upload: read field %q: %w", name, err)
+		}
+
+		switch name {
+		case "kind":
+			fields.Kind = string(buf)
+		case "password":
+			fields.Password = string(buf)
+		case "expiry":
+			raw := strings.TrimSpace(string(buf))
+			secs, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return uploadFields{}, fmt.Errorf("parse upload: invalid expiry %q: %w", raw, err)
+			}
+			d, ok := allowedExpiry(secs)
+			if !ok {
+				return uploadFields{}, fmt.Errorf("parse upload: expiry %d not allowed", secs)
+			}
+			fields.Expiry = d
+			expirySet = true
+		case "text":
+			fields.Text = string(buf)
+		}
+		// Unknown fields are silently dropped: a future template addition
+		// that lands ahead of a corresponding server change shouldn't 400.
+	}
+
+	if fields.Kind != "file" && fields.Kind != "text" {
+		return uploadFields{}, fmt.Errorf("parse upload: invalid kind %q", fields.Kind)
+	}
+	if !expirySet {
+		return uploadFields{}, fmt.Errorf("parse upload: expiry missing")
+	}
+
+	switch fields.Kind {
+	case "text":
+		if fields.Text == "" {
+			return uploadFields{}, fmt.Errorf("parse upload: text content is empty")
+		}
+		if fields.File != nil {
+			return uploadFields{}, fmt.Errorf("parse upload: text kind must not include a file part")
+		}
+	case "file":
+		if fields.File == nil {
+			return uploadFields{}, fmt.Errorf("parse upload: file kind requires a file part")
+		}
+		if fields.Filename == "" {
+			return uploadFields{}, fmt.Errorf("parse upload: file kind requires a non-empty filename")
+		}
+	}
+
+	return fields, nil
 }
 
 // loginHandler serves GET /login: the login page with the Telegram Login
