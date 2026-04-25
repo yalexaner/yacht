@@ -130,6 +130,21 @@ type uploadFormView struct {
 	Error                string
 }
 
+// shareCreatedView feeds share_created.html: the post-upload confirmation
+// page. ShareURL is the absolute external link the operator shares with a
+// recipient (cfg.BaseURL + "/" + share.ID); the template surfaces it next to
+// the copy button. Kind/Filename/Size are populated from the underlying row
+// — Filename and Size are zero values for text shares, and the template
+// branches on Kind.
+type shareCreatedView struct {
+	ID        string
+	ShareURL  string
+	Kind      string
+	Filename  string
+	Size      int64
+	ExpiresAt time.Time
+}
+
 // loginErrorMessages maps ?error= query codes produced by the auth handlers
 // (Tasks 7-9) to human-readable messages. Unknown codes resolve to an empty
 // string so an attacker cannot inject arbitrary text through the query
@@ -263,6 +278,57 @@ func (s *Server) uploadSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, "/shares/"+sh.ID+"/created", http.StatusSeeOther)
+}
+
+// createdHandler serves GET /shares/{id}/created: the post-upload
+// confirmation page that shows the freshly-minted share's external URL plus
+// the copy button. Wired behind RequireAuth at the mux, so user is
+// guaranteed present — the defensive miss-branch covers a routing
+// regression that ever lets the handler run without the gate.
+//
+// Owner-only by design: a share row owned by user A must not surface its
+// existence to user B's session. We map "not the creator" to 404 (rather
+// than 403) so a probing visitor cannot distinguish "this share exists but
+// isn't yours" from "this share does not exist" — the same shape as
+// shareHandler's NotFound mapping.
+//
+// Same sentinel-error mapping as shareHandler: ErrNotFound → 404,
+// ErrExpired → 410, anything else → logged + generic 500.
+func (s *Server) createdHandler(w http.ResponseWriter, r *http.Request) {
+	user, ok := middleware.UserFromContext(r.Context())
+	if !ok {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		return
+	}
+
+	sh, err := s.share.Get(r.Context(), id)
+	if err != nil {
+		s.renderShareError(w, r, err)
+		return
+	}
+
+	if sh.UserID != user.ID {
+		// 404 (not 403) keeps the existence of someone else's share invisible.
+		// A probing user with a guessed ID gets the same response shape as a
+		// genuinely missing one — no leak, no oracle.
+		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		return
+	}
+
+	s.render(w, http.StatusOK, "share_created.html", shareCreatedView{
+		ID:        sh.ID,
+		ShareURL:  s.cfg.BaseURL + "/" + sh.ID,
+		Kind:      sh.Kind,
+		Filename:  stringOrEmpty(sh.OriginalFilename),
+		Size:      int64OrZero(sh.SizeBytes),
+		ExpiresAt: sh.ExpiresAt,
+	})
 }
 
 // createFileShareFromPart spools the file part to a temp file on disk so we

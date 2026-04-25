@@ -129,6 +129,12 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /upload", s.RequireAuth()(http.HandlerFunc(s.uploadFormHandler)))
 	mux.Handle("POST /upload", s.RequireAuth()(http.HandlerFunc(s.uploadSubmitHandler)))
 
+	// /shares/{id}/created is the PRG landing target after a successful
+	// upload: shows the share URL with a copy button. Auth-gated and
+	// owner-only — the handler returns 404 to non-owners so a probing
+	// visitor cannot enumerate share IDs through this route.
+	mux.Handle("GET /shares/{id}/created", s.RequireAuth()(http.HandlerFunc(s.createdHandler)))
+
 	mux.HandleFunc("GET /{id}", s.shareHandler)
 	mux.HandleFunc("POST /{id}", s.passwordHandler)
 	mux.HandleFunc("GET /d/{id}", s.downloadHandler)

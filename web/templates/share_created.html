@@ -1,0 +1,20 @@
+{{define "title"}}Share created — yacht{{end}}
+{{define "content"}}
+<h1>Share created</h1>
+<p>Your share is ready. Copy the link below to send it.</p>
+
+<div class="share-url">
+  <input id="share-url-input" type="text" value="{{.ShareURL}}" readonly>
+  <button id="copy-btn" type="button" data-copy-text="{{.ShareURL}}">Copy</button>
+</div>
+
+{{if eq .Kind "file"}}
+<p class="meta">{{.Filename}} · {{humanBytes .Size}}</p>
+{{else if eq .Kind "text"}}
+<p class="meta"><a href="/{{.ID}}">View text share</a></p>
+{{end}}
+
+<p class="meta">Expires at {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
+
+<p><a class="btn" href="/upload">Create another share</a></p>
+{{end}}

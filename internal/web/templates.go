@@ -53,6 +53,7 @@ var pageTemplates = []string{
 	"login.html",
 	"home.html",
 	"upload.html",
+	"share_created.html",
 }
 
 // parseTemplates builds one fully-assembled template per page: a clone of
