@@ -38,11 +38,54 @@ button, .btn {
 }
 .meta { color: var(--muted); font-size: 0.9rem; }
 .error { color: #cb2431; margin: 0.5rem 0; }
-input[type=password] {
+input[type=password],
+input[type=text],
+select,
+textarea {
   padding: 0.5rem;
   border: 1px solid #d0d7de;
   border-radius: 6px;
   font-size: 1rem;
   width: 100%;
   max-width: 20rem;
+  font-family: inherit;
+}
+textarea { max-width: 100%; resize: vertical; }
+form label { display: block; margin: 0.75rem 0; }
+fieldset.kind-group {
+  border: 0;
+  padding: 0;
+  margin: 0.75rem 0;
+}
+fieldset.kind-group legend { padding: 0; font-weight: 600; }
+fieldset.kind-group label { display: inline-block; margin-right: 1rem; }
+.muted { color: var(--muted); font-size: 0.9rem; }
+progress {
+  width: 100%;
+  max-width: 20rem;
+  height: 0.75rem;
+  margin-top: 0.5rem;
+}
+.share-url {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+#share-url-input {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: #f6f8fa;
+  flex: 1;
+  max-width: none;
+}
+#copy-btn.copied {
+  background: #2ea44f;
+}
+.error {
+  color: #cb2431;
+  background: #ffeef0;
+  border: 1px solid #ffc1c8;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin: 0.5rem 0 1rem;
 }
