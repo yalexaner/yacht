@@ -194,15 +194,15 @@
 
 ## Phase 10: Web upload
 
-- [ ] Route `GET /upload` → form (file picker, text area, password field, expiry dropdown)
-- [ ] Route `POST /upload`:
-  - [ ] Validate size against `MAX_UPLOAD_BYTES`
-  - [ ] Hash password if present
-  - [ ] Call `share.CreateFileShare` or `CreateTextShare`
-  - [ ] Redirect to "created" page
-- [ ] Route `GET /shares/{id}/created` → URL + copy button + expiry info
-- [ ] Vanilla JS: upload progress bar (`XMLHttpRequest` progress events)
-- [ ] Vanilla JS: copy-to-clipboard button
+- [x] Route `GET /upload` → form (file picker, text area, password field, expiry dropdown)
+- [x] Route `POST /upload`:
+  - [x] Validate size against `MAX_UPLOAD_BYTES`
+  - [x] Hash password if present
+  - [x] Call `share.CreateFileShare` or `CreateTextShare`
+  - [x] Redirect to "created" page
+- [x] Route `GET /shares/{id}/created` → URL + copy button + expiry info
+- [x] Vanilla JS: upload progress bar (`XMLHttpRequest` progress events)
+- [x] Vanilla JS: copy-to-clipboard button
 - [ ] Manual test: upload via browser → URL → download in incognito
 
 ---
