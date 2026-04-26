@@ -1,6 +1,6 @@
-{{define "title"}}Upload — yacht{{end}}
+{{define "title"}}{{ T .Lang "page.upload.title" }}{{end}}
 {{define "content"}}
-<h1>Create a share</h1>
+<h1>{{ T .Lang "page.upload.heading" }}</h1>
 {{if .Error}}<p class="form-error">{{.Error}}</p>{{end}}
 <form method="post" action="/upload" enctype="multipart/form-data">
   {{/*
@@ -11,18 +11,18 @@
     silently breaks streamed file uploads.
   */}}
   <fieldset class="kind-group">
-    <legend>Share type</legend>
-    <label><input type="radio" name="kind" value="file" checked> File</label>
-    <label><input type="radio" name="kind" value="text"> Text</label>
+    <legend>{{ T .Lang "form.upload.legend.kind" }}</legend>
+    <label><input type="radio" name="kind" value="file" checked> {{ T .Lang "form.upload.option.file" }}</label>
+    <label><input type="radio" name="kind" value="text"> {{ T .Lang "form.upload.option.text" }}</label>
   </fieldset>
 
   <label>
-    Password (optional)
+    {{ T .Lang "form.upload.label.password" }}
     <input type="password" name="password" autocomplete="new-password">
   </label>
 
   <label>
-    Expires after
+    {{ T .Lang "form.upload.label.expiry" }}
     <select name="expiry">
       {{range .ExpiryOptions}}
       <option value="{{.Seconds}}"{{if eq .Seconds $.DefaultExpirySeconds}} selected{{end}}>{{.Label}}</option>
@@ -31,21 +31,21 @@
   </label>
 
   <label class="text-block">
-    Text content
+    {{ T .Lang "form.upload.label.text" }}
     <textarea name="text" rows="6"></textarea>
-    <span class="muted">Maximum text size: {{humanBytes .MaxTextBytes}}.</span>
+    <span class="muted">{{ printf (T .Lang "form.upload.help.textsize") (humanBytes .MaxTextBytes) }}</span>
   </label>
 
   <label class="file-block">
-    File
+    {{ T .Lang "form.upload.label.file" }}
     <input type="file" name="file">
-    <span class="muted">Maximum file size: {{humanBytes .MaxUploadBytes}}.</span>
+    <span class="muted">{{ printf (T .Lang "form.upload.help.filesize") (humanBytes .MaxUploadBytes) }}</span>
   </label>
 
   <progress id="upload-progress" max="100" value="0" hidden></progress>
   <span id="upload-percent" hidden></span>
 
-  <button type="submit">Create share</button>
+  <button type="submit">{{ T .Lang "button.create.share" }}</button>
 </form>
 {{/*
   upload.js is purely additive: it intercepts the submit to drive a progress

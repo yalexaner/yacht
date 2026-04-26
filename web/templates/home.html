@@ -1,9 +1,9 @@
-{{define "title"}}yacht{{end}}
+{{define "title"}}{{ T .Lang "page.home.title" }}{{end}}
 {{define "content"}}
-<h1>Logged in</h1>
-{{if .DisplayName}}<p>Welcome, {{.DisplayName}}.</p>{{else}}<p>Welcome.</p>{{end}}
-<p><a href="/upload">Create a share</a> — upload a file or paste text to mint a link.</p>
+<h1>{{ T .Lang "page.home.heading" }}</h1>
+{{if .DisplayName}}<p>{{ printf (T .Lang "page.home.welcome.named") .DisplayName }}</p>{{else}}<p>{{ T .Lang "page.home.welcome.anonymous" }}</p>{{end}}
+<p><a href="/upload">{{ T .Lang "page.home.create_share.link" }}</a> {{ T .Lang "page.home.create_share.description" }}</p>
 <form method="post" action="/logout">
-  <button type="submit">Log out</button>
+  <button type="submit">{{ T .Lang "button.logout" }}</button>
 </form>
 {{end}}

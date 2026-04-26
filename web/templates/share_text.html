@@ -1,7 +1,7 @@
-{{define "title"}}Text share — yacht{{end}}
+{{define "title"}}{{ T .Lang "page.share_text.title" }}{{end}}
 {{define "content"}}
-<h1>Text share</h1>
-<p class="meta">expires {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
+<h1>{{ T .Lang "page.share_text.heading" }}</h1>
+<p class="meta">{{ printf (T .Lang "page.share_text.meta") (.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC") }}</p>
 <pre>{{.Content}}</pre>
-<p><a class="btn" href="/d/{{.ID}}">Download as .txt</a></p>
+<p><a class="btn" href="/d/{{.ID}}">{{ T .Lang "button.download.astext" }}</a></p>
 {{end}}

@@ -42,6 +42,7 @@ var bundleRU = map[string]string{
 	"error.badrequest.form_read":          "Не удалось прочитать отправленную форму.",
 	"error.badrequest.share_notprotected": "Эта ссылка не защищена паролем.",
 	"error.badrequest.title":              "Некорректный запрос",
+	"error.badrequest.unsupportedlang":    "Неподдерживаемый язык.",
 	"error.gone.share_expired":            "Срок действия этой ссылки истёк.",
 	"error.gone.title":                    "Удалено",
 	"error.internal.message":              "Произошла внутренняя ошибка.",

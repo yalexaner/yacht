@@ -111,7 +111,7 @@ func (s *Server) Routes() http.Handler {
 
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.static))))
 
-	mux.HandleFunc("GET /login", s.loginHandler)
+	mux.Handle("GET /login", s.lang()(http.HandlerFunc(s.loginHandler)))
 	mux.HandleFunc("GET /auth/telegram/callback", s.telegramCallbackHandler)
 	mux.HandleFunc("GET /auth/{token}", s.botTokenHandler)
 	mux.HandleFunc("POST /logout", s.logoutHandler)
@@ -119,33 +119,40 @@ func (s *Server) Routes() http.Handler {
 	// Anonymous-friendly: the language switcher must work for first-time
 	// visitors who haven't logged in yet. langHandler resolves the
 	// session cookie inline (best-effort) so an authenticated visitor
-	// also gets users.lang persisted.
-	mux.HandleFunc("GET /lang/{code}", s.langHandler)
+	// also gets users.lang persisted. The lang middleware runs in front
+	// of the handler so a 400 error page (unsupported code) renders in
+	// the visitor's existing language preference rather than always in
+	// English — Task 7 wires the error template through the bundle.
+	mux.Handle("GET /lang/{code}", s.lang()(http.HandlerFunc(s.langHandler)))
 
-	// GET / is gated behind RequireAuth so the post-login redirect lands
-	// somewhere meaningful: an authed visitor sees the placeholder home,
-	// an unauthed one is bounced back to /login by the middleware (which
-	// is exactly the loop we want — without this route, "/" would 404 and
-	// the login flow would look broken on success).
-	mux.Handle("GET /{$}", s.RequireAuth()(http.HandlerFunc(s.homeHandler)))
+	// Auth-gated routes wrap the lang middleware INSIDE RequireAuth so the
+	// resolver sees the hydrated *auth.User on the context — that's the only
+	// way `users.lang` can win over Accept-Language for a logged-in visitor.
+	// Public routes that still render templates apply lang on their own
+	// (loginHandler above, share/password/download below) so the template
+	// always sees a resolved language regardless of which path it travelled.
+	mux.Handle("GET /{$}", s.RequireAuth()(s.lang()(http.HandlerFunc(s.homeHandler))))
+	mux.Handle("GET /upload", s.RequireAuth()(s.lang()(http.HandlerFunc(s.uploadFormHandler))))
+	mux.Handle("POST /upload", s.RequireAuth()(s.lang()(http.HandlerFunc(s.uploadSubmitHandler))))
+	mux.Handle("GET /shares/{id}/created", s.RequireAuth()(s.lang()(http.HandlerFunc(s.createdHandler))))
 
-	// Upload routes are gated behind RequireAuth: only logged-in operators
-	// mint shares. The download/share-page routes below stay public so a
-	// recipient with a link can fetch without an account.
-	mux.Handle("GET /upload", s.RequireAuth()(http.HandlerFunc(s.uploadFormHandler)))
-	mux.Handle("POST /upload", s.RequireAuth()(http.HandlerFunc(s.uploadSubmitHandler)))
-
-	// /shares/{id}/created is the PRG landing target after a successful
-	// upload: shows the share URL with a copy button. Auth-gated and
-	// owner-only — the handler returns 404 to non-owners so a probing
-	// visitor cannot enumerate share IDs through this route.
-	mux.Handle("GET /shares/{id}/created", s.RequireAuth()(http.HandlerFunc(s.createdHandler)))
-
-	mux.HandleFunc("GET /{id}", s.shareHandler)
-	mux.HandleFunc("POST /{id}", s.passwordHandler)
-	mux.HandleFunc("GET /d/{id}", s.downloadHandler)
+	mux.Handle("GET /{id}", s.lang()(http.HandlerFunc(s.shareHandler)))
+	mux.Handle("POST /{id}", s.lang()(http.HandlerFunc(s.passwordHandler)))
+	mux.Handle("GET /d/{id}", s.lang()(http.HandlerFunc(s.downloadHandler)))
 
 	return s.logMiddleware(mux)
+}
+
+// lang returns the language-resolution middleware preconfigured with this
+// server's DB handle, the language cookie name, and the configured default.
+// Mirrors RequireAuth's accessor pattern so the route table can chain the
+// middleware without re-stating the construction args at every call site.
+func (s *Server) lang() func(http.Handler) http.Handler {
+	defaultLang := "en"
+	if s.cfg != nil && s.cfg.Shared != nil && s.cfg.Shared.DefaultLang != "" {
+		defaultLang = s.cfg.Shared.DefaultLang
+	}
+	return middleware.ResolveLang(s.db, langCookieName, defaultLang)
 }
 
 // RequireAuth returns the session-gate middleware preconfigured with this

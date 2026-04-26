@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,6 +203,41 @@ func TestLang_UnknownCode(t *testing.T) {
 	}
 	if _, isNull := readUserLang(t, handle, userID); !isNull {
 		t.Errorf("users.lang should remain NULL on unknown code")
+	}
+}
+
+// TestLang_UnknownCode_RendersRussianError: a yacht_lang=ru cookie present
+// on the request must steer the 400 error page through the Russian bundle
+// — even though the requested target language ("zh") was rejected. Locks
+// in Task 7's renderError → bundle-key wiring on a path that's easy to
+// drive without minting a session: an existing language preference must
+// survive a junk switch attempt.
+func TestLang_UnknownCode_RendersRussianError(t *testing.T) {
+	srv, _ := newLangTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/lang/zh", nil)
+	req.AddCookie(&http.Cookie{Name: "yacht_lang", Value: "ru"})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status: want 400, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// "Неподдерживаемый язык." is the RU translation of
+	// error.badrequest.unsupportedlang. Substring-asserting the trailing
+	// dot would be brittle if the period ever moves into the bundle; the
+	// body is enough.
+	if !strings.Contains(body, "Неподдерживаемый язык") {
+		t.Errorf("body missing Russian unsupported-language message; got:\n%s", body)
+	}
+	// "Некорректный запрос" is the RU translation of error.badrequest.title.
+	if !strings.Contains(body, "Некорректный запрос") {
+		t.Errorf("body missing Russian error title; got:\n%s", body)
+	}
+	// Defense-in-depth: bundle keys must never leak through as text.
+	if strings.Contains(body, "error.badrequest") {
+		t.Errorf("body leaked bundle key as text; got:\n%s", body)
 	}
 }
 

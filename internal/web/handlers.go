@@ -59,6 +59,7 @@ const langCookieMaxAge = 365 * 24 * time.Hour
 // carries several *string / *int64 columns whose nil-checking boilerplate
 // belongs in Go code, not HTML.
 type fileShareView struct {
+	Lang      string
 	ID        string
 	Filename  string
 	Size      int64
@@ -71,6 +72,7 @@ type fileShareView struct {
 // the body, so user-supplied "<script>..." text becomes escaped HTML —
 // Phase 8 adds explicit regression coverage.
 type textShareView struct {
+	Lang      string
 	ID        string
 	Content   string
 	ExpiresAt time.Time
@@ -80,6 +82,7 @@ type textShareView struct {
 // action URL; Error is the human-readable message shown above the input
 // when a previous submission was rejected (empty on first display).
 type passwordPromptView struct {
+	Lang  string
 	ID    string
 	Error string
 }
@@ -88,6 +91,7 @@ type passwordPromptView struct {
 // the body paragraph below. Both strings are user-facing — keep them short
 // and free of internal detail.
 type errorView struct {
+	Lang    string
 	Title   string
 	Message string
 }
@@ -97,6 +101,7 @@ type errorView struct {
 // generic "Welcome." line so the page stays well-formed for accounts that
 // never set a Telegram display name.
 type homeView struct {
+	Lang        string
 	DisplayName string
 }
 
@@ -106,6 +111,7 @@ type homeView struct {
 // when the login flow redirected the user back with an ?error= code; empty
 // on first display.
 type loginView struct {
+	Lang        string
 	BotUsername string
 	Error       string
 }
@@ -143,6 +149,7 @@ var expiryOptions = []expiryOption{
 // cap, files ride MaxUploadBytes). Error is the banner shown above the
 // form when a previous submission was rejected.
 type uploadFormView struct {
+	Lang                 string
 	ExpiryOptions        []expiryOption
 	DefaultExpirySeconds int64
 	MaxUploadBytes       int64
@@ -157,6 +164,7 @@ type uploadFormView struct {
 // — Filename and Size are zero values for text shares, and the template
 // branches on Kind.
 type shareCreatedView struct {
+	Lang      string
 	ID        string
 	ShareURL  string
 	Kind      string
@@ -166,16 +174,17 @@ type shareCreatedView struct {
 }
 
 // loginErrorMessages maps ?error= query codes produced by the auth handlers
-// (Tasks 7-9) to human-readable messages. Unknown codes resolve to an empty
-// string so an attacker cannot inject arbitrary text through the query
-// param — even though html/template would auto-escape it, not echoing
-// untrusted strings at all is the simpler guarantee.
+// to bundle keys. The login handler resolves the key into the visitor's
+// language at render time. Unknown codes resolve to an empty string so an
+// attacker cannot inject arbitrary text through the query param — even
+// though html/template would auto-escape it, not echoing untrusted strings
+// at all is the simpler guarantee.
 var loginErrorMessages = map[string]string{
-	"invalid_signature": "The Telegram login signature did not verify. Please try again.",
-	"access_denied":     "Access denied — your Telegram account is not authorized to log in.",
-	"invalid_link":      "That login link is not valid.",
-	"link_expired":      "Your login link has expired. Send /weblogin to the bot for a fresh one.",
-	"link_used":         "That login link has already been used.",
+	"invalid_signature": "error.auth.invalid_signature",
+	"access_denied":     "error.auth.access_denied",
+	"invalid_link":      "error.auth.invalid_link",
+	"link_expired":      "error.auth.link_expired",
+	"link_used":         "error.auth.link_used",
 }
 
 // homeHandler serves GET /: the post-login landing page. Wired behind
@@ -195,7 +204,10 @@ func (s *Server) homeHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	s.render(w, http.StatusOK, "home.html", homeView{DisplayName: user.DisplayName})
+	s.render(w, http.StatusOK, "home.html", homeView{
+		Lang:        middleware.LangFromContext(r.Context()),
+		DisplayName: user.DisplayName,
+	})
 }
 
 // uploadFormHandler serves GET /upload: the upload form. Wired behind
@@ -207,6 +219,7 @@ func (s *Server) homeHandler(w http.ResponseWriter, r *http.Request) {
 // upload size cap so the template can show it humanized.
 func (s *Server) uploadFormHandler(w http.ResponseWriter, r *http.Request) {
 	s.render(w, http.StatusOK, "upload.html", uploadFormView{
+		Lang:                 middleware.LangFromContext(r.Context()),
 		ExpiryOptions:        expiryOptions,
 		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
 		MaxUploadBytes:       s.cfg.MaxUploadBytes,
@@ -220,8 +233,9 @@ func (s *Server) uploadFormHandler(w http.ResponseWriter, r *http.Request) {
 // bounced to the generic error template — losing their intent in the
 // process. Pulled out of the handler so the various failure branches share
 // a single render call site.
-func (s *Server) renderUploadForm(w http.ResponseWriter, status int, msg string) {
+func (s *Server) renderUploadForm(w http.ResponseWriter, r *http.Request, status int, msg string) {
 	s.render(w, status, "upload.html", uploadFormView{
+		Lang:                 middleware.LangFromContext(r.Context()),
 		ExpiryOptions:        expiryOptions,
 		DefaultExpirySeconds: defaultExpirySeconds(s.cfg.DefaultExpiry),
 		MaxUploadBytes:       s.cfg.MaxUploadBytes,
@@ -257,25 +271,25 @@ func (s *Server) uploadSubmitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	lang := middleware.LangFromContext(r.Context())
 	fields, err := parseUploadForm(r, s.cfg.MaxUploadBytes)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("That upload is too large — the limit is %s.", humanBytes(s.cfg.MaxUploadBytes)))
+			s.renderUploadForm(w, r, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf(i18n.T(lang, "error.upload.toolarge"), humanBytes(s.cfg.MaxUploadBytes)))
 			return
 		}
 		// Text-overflow gets its own banner so the operator knows which cap
 		// they hit (the text cap is far below MaxUploadBytes; surfacing the
 		// generic message would mislead).
 		if errors.Is(err, errTextTooLarge) {
-			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("That text is too long — the limit is %s.", humanBytes(uploadFieldMaxBytes)))
+			s.renderUploadForm(w, r, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf(i18n.T(lang, "error.upload.toolargetext"), humanBytes(uploadFieldMaxBytes)))
 			return
 		}
 		s.logger.Warn("parse upload form", "err", err)
-		s.renderUploadForm(w, http.StatusBadRequest,
-			"We could not process the form. Please check your inputs and try again.")
+		s.renderUploadForm(w, r, http.StatusBadRequest, i18n.T(lang, "error.upload.parse"))
 		return
 	}
 
@@ -297,13 +311,12 @@ func (s *Server) uploadSubmitHandler(w http.ResponseWriter, r *http.Request) {
 		// 413 page rather than the generic 500.
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			s.renderUploadForm(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("That upload is too large — the limit is %s.", humanBytes(s.cfg.MaxUploadBytes)))
+			s.renderUploadForm(w, r, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf(i18n.T(lang, "error.upload.toolarge"), humanBytes(s.cfg.MaxUploadBytes)))
 			return
 		}
 		s.logger.Error("create share", "kind", fields.Kind, "user_id", user.ID, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong",
-			"We could not create your share. Please try again.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.upload.failed")
 		return
 	}
 
@@ -333,7 +346,7 @@ func (s *Server) createdHandler(w http.ResponseWriter, r *http.Request) {
 
 	id := r.PathValue("id")
 	if id == "" {
-		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		s.renderError(w, r, http.StatusNotFound, "error.notfound.title", "error.notfound.message")
 		return
 	}
 
@@ -347,12 +360,13 @@ func (s *Server) createdHandler(w http.ResponseWriter, r *http.Request) {
 		// 404 (not 403) keeps the existence of someone else's share invisible.
 		// A probing user with a guessed ID gets the same response shape as a
 		// genuinely missing one — no leak, no oracle.
-		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		s.renderError(w, r, http.StatusNotFound, "error.notfound.title", "error.notfound.message")
 		return
 	}
 
 	s.render(w, http.StatusOK, "share_created.html", shareCreatedView{
-		ID: sh.ID,
+		Lang: middleware.LangFromContext(r.Context()),
+		ID:   sh.ID,
 		// TrimRight normalises a trailing slash on BaseURL so an operator
 		// setting BASE_URL=https://example.com/ doesn't produce a
 		// double-slashed share URL. Same reasoning as the bot's
@@ -634,9 +648,15 @@ func parseUploadForm(r *http.Request, maxBytes int64) (uploadFields, error) {
 // loginErrorMessages render anything; arbitrary values are dropped on the
 // floor so the page never echoes untrusted text.
 func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
+	lang := middleware.LangFromContext(r.Context())
+	errMsg := ""
+	if key, ok := loginErrorMessages[r.URL.Query().Get("error")]; ok {
+		errMsg = i18n.T(lang, key)
+	}
 	s.render(w, http.StatusOK, "login.html", loginView{
+		Lang:        lang,
 		BotUsername: s.cfg.TelegramBotUsername,
-		Error:       loginErrorMessages[r.URL.Query().Get("error")],
+		Error:       errMsg,
 	})
 }
 
@@ -664,14 +684,14 @@ func (s *Server) telegramCallbackHandler(w http.ResponseWriter, r *http.Request)
 		return
 	default:
 		s.logger.Error("telegram widget verify", "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 
 	sessionID, err := auth.CreateSession(r.Context(), s.db, user.ID, s.authTelegram.Name(), s.cfg.SessionLifetime)
 	if err != nil {
 		s.logger.Error("create session (telegram widget)", "user_id", user.ID, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 
@@ -727,7 +747,7 @@ func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/login?error=invalid_link", http.StatusSeeOther)
 		default:
 			s.logger.Error("bot token exists check", "err", err)
-			s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+			s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		}
 		return
 	}
@@ -735,7 +755,7 @@ func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		s.logger.Error("begin tx (bot token)", "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 	// Rollback is a no-op after a successful Commit, so the defer is safe
@@ -761,20 +781,20 @@ func (s *Server) botTokenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	default:
 		s.logger.Error("bot token consume", "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 
 	sessionID, err := auth.CreateSessionTx(r.Context(), tx, user.ID, s.authBotToken.Name(), s.cfg.SessionLifetime)
 	if err != nil {
 		s.logger.Error("create session (bot token)", "user_id", user.ID, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 
 	if err := tx.Commit(); err != nil {
 		s.logger.Error("commit (bot token)", "user_id", user.ID, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 
@@ -853,7 +873,7 @@ func (s *Server) logoutHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) langHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
 	if !i18n.IsSupported(code) {
-		s.renderError(w, http.StatusBadRequest, "Bad Request", "Unsupported language.")
+		s.renderError(w, r, http.StatusBadRequest, "error.badrequest.title", "error.badrequest.unsupportedlang")
 		return
 	}
 
@@ -969,7 +989,7 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		// defense-in-depth: the mux pattern "GET /{id}" should never route an
 		// empty id here, but returning 404 is the right response if it does.
-		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		s.renderError(w, r, http.StatusNotFound, "error.notfound.title", "error.notfound.message")
 		return
 	}
 
@@ -980,13 +1000,17 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sh.PasswordHash != nil && !s.hasShareCookie(r, sh) {
-		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{ID: id})
+		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{
+			Lang: middleware.LangFromContext(r.Context()),
+			ID:   id,
+		})
 		return
 	}
 
 	switch sh.Kind {
 	case share.KindFile:
 		s.render(w, http.StatusOK, "share_file.html", fileShareView{
+			Lang:      middleware.LangFromContext(r.Context()),
 			ID:        sh.ID,
 			Filename:  stringOrEmpty(sh.OriginalFilename),
 			Size:      int64OrZero(sh.SizeBytes),
@@ -994,6 +1018,7 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	case share.KindText:
 		s.render(w, http.StatusOK, "share_text.html", textShareView{
+			Lang:      middleware.LangFromContext(r.Context()),
 			ID:        sh.ID,
 			Content:   stringOrEmpty(sh.TextContent),
 			ExpiresAt: sh.ExpiresAt,
@@ -1003,7 +1028,7 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 		// don't own or someone edited rows by hand; log and fail loud so the
 		// operator investigates rather than silently rendering an empty page.
 		s.logger.Error("unknown share kind", "id", id, "kind", sh.Kind)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "We could not display this share.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.share.unavailable")
 	}
 }
 
@@ -1025,7 +1050,7 @@ func (s *Server) shareHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
-		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		s.renderError(w, r, http.StatusNotFound, "error.notfound.title", "error.notfound.message")
 		return
 	}
 
@@ -1040,14 +1065,14 @@ func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 		// unprotected share, so reaching here means a client posted directly.
 		// Surface as 400 rather than silently proceeding so the oddity shows
 		// up in logs instead of landing a cookie on every visitor.
-		s.renderError(w, http.StatusBadRequest, "Bad Request", "This share is not password protected.")
+		s.renderError(w, r, http.StatusBadRequest, "error.badrequest.title", "error.badrequest.share_notprotected")
 		return
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, passwordFormMaxBytes)
 	if err := r.ParseForm(); err != nil {
 		s.logger.Error("password form parse failed", "id", id, "err", err)
-		s.renderError(w, http.StatusBadRequest, "Bad Request", "Could not read the submitted form.")
+		s.renderError(w, r, http.StatusBadRequest, "error.badrequest.title", "error.badrequest.form_read")
 		return
 	}
 	plaintext := r.PostForm.Get("password")
@@ -1073,14 +1098,16 @@ func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/"+id, http.StatusSeeOther)
 		return
 	case errors.Is(err, share.ErrPasswordMismatch):
+		lang := middleware.LangFromContext(r.Context())
 		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{
+			Lang:  lang,
 			ID:    id,
-			Error: "Incorrect password",
+			Error: i18n.T(lang, "error.password.incorrect"),
 		})
 		return
 	default:
 		s.logger.Error("verify password failed", "id", id, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 }
@@ -1091,20 +1118,28 @@ func (s *Server) passwordHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) renderShareError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, share.ErrNotFound):
-		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		s.renderError(w, r, http.StatusNotFound, "error.notfound.title", "error.notfound.message")
 	case errors.Is(err, share.ErrExpired):
-		s.renderError(w, http.StatusGone, "Gone", "This share has expired.")
+		s.renderError(w, r, http.StatusGone, "error.gone.title", "error.gone.share_expired")
 	default:
 		s.logger.Error("share lookup failed", "method", r.Method, "path", r.URL.Path, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 	}
 }
 
 // renderError is the single entry point that writes the error.html template.
-// Centralizing the render keeps the error layout consistent across handlers
-// and gives us one spot to add logging or metrics in a later phase.
-func (s *Server) renderError(w http.ResponseWriter, status int, title, message string) {
-	s.render(w, status, "error.html", errorView{Title: title, Message: message})
+// titleKey and messageKey are i18n bundle keys; the resolved language comes
+// off the request context (set by the lang middleware). Routing every error
+// page through one helper means the bundle lookup happens in exactly one
+// place — call sites pass keys, never raw English — so a future bundle
+// rename only touches the call sites, not the render path.
+func (s *Server) renderError(w http.ResponseWriter, r *http.Request, status int, titleKey, messageKey string) {
+	lang := middleware.LangFromContext(r.Context())
+	s.render(w, status, "error.html", errorView{
+		Lang:    lang,
+		Title:   i18n.T(lang, titleKey),
+		Message: i18n.T(lang, messageKey),
+	})
 }
 
 // shareCookieName returns the per-share unlock-cookie name set by the
@@ -1181,7 +1216,7 @@ func (s *Server) hasShareCookie(r *http.Request, sh *share.Share) bool {
 func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
-		s.renderError(w, http.StatusNotFound, "Not Found", "That share does not exist.")
+		s.renderError(w, r, http.StatusNotFound, "error.notfound.title", "error.notfound.message")
 		return
 	}
 
@@ -1192,7 +1227,10 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sh.PasswordHash != nil && !s.hasShareCookie(r, sh) {
-		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{ID: id})
+		s.render(w, http.StatusUnauthorized, "password.html", passwordPromptView{
+			Lang: middleware.LangFromContext(r.Context()),
+			ID:   id,
+		})
 		return
 	}
 
@@ -1203,7 +1241,7 @@ func (s *Server) downloadHandler(w http.ResponseWriter, r *http.Request) {
 		s.streamTextShare(w, r, sh)
 	default:
 		s.logger.Error("unknown share kind", "id", id, "kind", sh.Kind)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "We could not display this share.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.share.unavailable")
 	}
 }
 
@@ -1219,11 +1257,11 @@ func (s *Server) streamFileShare(w http.ResponseWriter, r *http.Request, sh *sha
 			// drift state that warrants an operator alert, but to the user
 			// looks indistinguishable from any other internal failure.
 			s.logger.Warn("storage object missing for share", "id", sh.ID, "err", err)
-			s.renderError(w, http.StatusInternalServerError, "Something went wrong", "The backing data for this share is unavailable.")
+			s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.storage.missing")
 			return
 		}
 		s.logger.Error("open content failed", "id", sh.ID, "err", err)
-		s.renderError(w, http.StatusInternalServerError, "Something went wrong", "An internal error occurred.")
+		s.renderError(w, r, http.StatusInternalServerError, "error.internal.title", "error.internal.message")
 		return
 	}
 	defer body.Close()

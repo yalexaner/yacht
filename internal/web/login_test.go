@@ -111,3 +111,81 @@ func TestLogin_UnknownErrorCodeDropped(t *testing.T) {
 		t.Errorf("body leaked raw <script> from query param; got:\n%s", body)
 	}
 }
+
+// TestLogin_RendersRussianWithCookie: a yacht_lang=ru cookie on a public
+// route must flow through the lang middleware and into the rendered
+// template, producing Russian copy in place of the English defaults. The
+// login page is the convenient probe — it's public (no session plumbing
+// required) and exercises a representative slice of the bundle: page
+// heading, description, and the login fallback subkeys all appear in one
+// render.
+func TestLogin_RendersRussianWithCookie(t *testing.T) {
+	srv := newLoginTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	req.AddCookie(&http.Cookie{Name: "yacht_lang", Value: "ru"})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"Вход",
+		"Войдите через свой аккаунт Telegram.",
+		"Не видите кнопку «Войти через Telegram»?",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing Russian string %q; got:\n%s", want, body)
+		}
+	}
+	// The English heading must NOT leak through when ru is requested. Pin
+	// the substring to the heading specifically (not "Log in" alone, which
+	// would also match the URL "/login") so we catch a genuine fall-through
+	// rather than a false-positive on the path string.
+	if strings.Contains(body, ">Log in</h1>") {
+		t.Errorf("body leaked English heading despite ru cookie; got:\n%s", body)
+	}
+	// The <html lang="..."> attribute must reflect the resolved language so
+	// assistive tech and search engines see the correct locale.
+	if !strings.Contains(body, `<html lang="ru">`) {
+		t.Errorf(`body missing <html lang="ru">; got:`+"\n%s", body)
+	}
+}
+
+// TestLogin_RendersErrorBannerInRussian: with yacht_lang=ru cookie set,
+// GET /login?error=link_expired must surface the Russian translation of
+// the auth-error message. Locks in Task 7's loginErrorMessages → bundle-
+// key conversion: a regression that returned the raw English string (or
+// the bundle key itself) would fail this assertion.
+func TestLogin_RendersErrorBannerInRussian(t *testing.T) {
+	srv := newLoginTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/login?error=link_expired", nil)
+	req.AddCookie(&http.Cookie{Name: "yacht_lang", Value: "ru"})
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `<p class="error">`) {
+		t.Errorf("error banner missing; body:\n%s", body)
+	}
+	// "Срок действия ссылки истёк" is the RU translation of the
+	// link_expired auth error; assert a stable substring rather than the
+	// full sentence so a tweak to the translation copy doesn't fail this
+	// test for the wrong reason.
+	if !strings.Contains(body, "Срок действия ссылки истёк") {
+		t.Errorf("body missing Russian error message; got:\n%s", body)
+	}
+	// Defense-in-depth: the bundle key must never leak through as the
+	// rendered text. A regression that forgot the T() lookup (or used
+	// the wrong key) would surface as the literal "error.auth.link_expired"
+	// in the response body.
+	if strings.Contains(body, "error.auth.link_expired") {
+		t.Errorf("body leaked bundle key as text; got:\n%s", body)
+	}
+}

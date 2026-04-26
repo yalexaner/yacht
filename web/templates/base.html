@@ -1,9 +1,9 @@
 <!doctype html>
-<html>
+<html lang="{{ .Lang }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{{block "title" .}}yacht{{end}}</title>
+  <title>{{block "title" .}}{{ T .Lang "page.default.title" }}{{end}}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>

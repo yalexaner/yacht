@@ -43,6 +43,7 @@ var bundleEN = map[string]string{
 	"error.badrequest.form_read":          "Could not read the submitted form.",
 	"error.badrequest.share_notprotected": "This share is not password protected.",
 	"error.badrequest.title":              "Bad Request",
+	"error.badrequest.unsupportedlang":    "Unsupported language.",
 	"error.gone.share_expired":            "This share has expired.",
 	"error.gone.title":                    "Gone",
 	"error.internal.message":              "An internal error occurred.",

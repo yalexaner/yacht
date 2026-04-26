@@ -1,19 +1,19 @@
-{{define "title"}}Log in — yacht{{end}}
+{{define "title"}}{{ T .Lang "page.login.title" }}{{end}}
 {{define "content"}}
-<h1>Log in</h1>
+<h1>{{ T .Lang "page.login.heading" }}</h1>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<p>Sign in with your Telegram account.</p>
+<p>{{ T .Lang "page.login.description" }}</p>
 <script async src="https://telegram.org/js/telegram-widget.js?22"
   data-telegram-login="{{.BotUsername}}"
   data-size="large"
   data-auth-url="/auth/telegram/callback"></script>
 <section class="fallback">
-  <p class="muted">Don't see a "Log in with Telegram" button?</p>
+  <p class="muted">{{ T .Lang "page.login.fallback.heading" }}</p>
   <p class="muted">
-    The widget may be blocked on your network. Open
+    {{ T .Lang "page.login.fallback.body.before" }}
     <a href="https://t.me/{{.BotUsername}}">@{{.BotUsername}}</a>
-    in Telegram and send <code>/weblogin</code> — the bot will reply with a
-    one-time login link.
+    {{ T .Lang "page.login.fallback.body.middle" }} <code>/weblogin</code>
+    {{ T .Lang "page.login.fallback.body.outro" }}
   </p>
 </section>
 {{end}}

@@ -6,6 +6,8 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+
+	"github.com/yalexaner/yacht/internal/i18n"
 )
 
 // templateFuncs lists every helper the HTML templates reach for. Registered
@@ -14,6 +16,7 @@ import (
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
 		"humanBytes": humanBytes,
+		"T":          i18n.T,
 	}
 }
 

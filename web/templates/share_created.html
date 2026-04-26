@@ -1,22 +1,22 @@
-{{define "title"}}Share created — yacht{{end}}
+{{define "title"}}{{ T .Lang "page.share_created.title" }}{{end}}
 {{define "content"}}
-<h1>Share created</h1>
-<p>Your share is ready. Copy the link below to send it.</p>
+<h1>{{ T .Lang "page.share_created.heading" }}</h1>
+<p>{{ T .Lang "page.share_created.description" }}</p>
 
 <div class="share-url">
   <input id="share-url-input" type="text" value="{{.ShareURL}}" readonly>
-  <button id="copy-btn" type="button" data-copy-text="{{.ShareURL}}">Copy</button>
+  <button id="copy-btn" type="button" data-copy-text="{{.ShareURL}}">{{ T .Lang "button.copy" }}</button>
 </div>
 
 {{if eq .Kind "file"}}
 <p class="meta">{{.Filename}} · {{humanBytes .Size}}</p>
 {{else if eq .Kind "text"}}
-<p class="meta"><a href="/{{.ID}}">View text share</a></p>
+<p class="meta"><a href="/{{.ID}}">{{ T .Lang "page.share_created.view_text" }}</a></p>
 {{end}}
 
-<p class="meta">Expires at {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
+<p class="meta">{{ printf (T .Lang "page.share_created.expires_at") (.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC") }}</p>
 
-<p><a class="btn" href="/upload">Create another share</a></p>
+<p><a class="btn" href="/upload">{{ T .Lang "page.share_created.create_another" }}</a></p>
 {{/*
   copy.js binds [data-copy-text] elements to clipboard writes with a
   legacy execCommand fallback for non-secure contexts. Loaded with defer

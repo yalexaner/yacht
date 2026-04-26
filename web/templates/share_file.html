@@ -1,6 +1,6 @@
-{{define "title"}}{{.Filename}} — yacht{{end}}
+{{define "title"}}{{ printf (T .Lang "page.share_file.title") .Filename }}{{end}}
 {{define "content"}}
 <h1>{{.Filename}}</h1>
-<p class="meta">{{humanBytes .Size}} · expires {{.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC"}}</p>
-<p><a class="btn" href="/d/{{.ID}}">Download</a></p>
+<p class="meta">{{ printf (T .Lang "page.share_file.meta") (humanBytes .Size) (.ExpiresAt.UTC.Format "2006-01-02 15:04 UTC") }}</p>
+<p><a class="btn" href="/d/{{.ID}}">{{ T .Lang "button.download" }}</a></p>
 {{end}}
