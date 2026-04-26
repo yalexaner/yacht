@@ -10,6 +10,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/yalexaner/yacht/internal/auth"
+	"github.com/yalexaner/yacht/internal/i18n"
 	"github.com/yalexaner/yacht/internal/share"
 )
 
@@ -19,25 +20,6 @@ import (
 // comfortable room to switch tabs, paste the URL, and hit enter.
 const webLoginTokenTTL = 5 * time.Minute
 
-// webLoginRateLimitedReply is the copy sent when CreateLoginToken returns
-// ErrRateLimited. Mentions the earlier message explicitly so the user
-// remembers to scroll back rather than re-requesting again and again.
-const webLoginRateLimitedReply = "You already requested a login link recently — check earlier messages. Try again in a minute."
-
-// webLoginNonPrivateReply is the copy sent when /weblogin is issued from a
-// group, supergroup, or channel. The login URL is a single-use credential —
-// echoing it into a multi-member chat would expose it to every other member,
-// who could then redeem it before the legitimate sender. Refuse the mint
-// outright and tell the operator to DM the bot.
-const webLoginNonPrivateReply = "Send /weblogin in a direct message to me — login links must not be posted in group chats."
-
-// genericErrorReply is the copy sent when a share fails for any reason the
-// user can't act on (DB/storage/Telegram hiccups). The message intentionally
-// says nothing about the underlying cause — operators diagnose via logs, and
-// exposing error detail in the reply could leak internals to unauthorized
-// senders if the dispatcher's auth check ever regressed.
-const genericErrorReply = "Something went wrong. Try again in a moment."
-
 // handleStart renders the welcome copy sent in response to /start. It returns a
 // MessageConfig the dispatcher forwards to telegramAPI.Send; no Telegram I/O
 // happens here so the handler stays pure and trivially testable.
@@ -45,11 +27,8 @@ const genericErrorReply = "Something went wrong. Try again in a moment."
 // DefaultExpiry is rendered via its String() form ("24h0m0s"); humanising the
 // duration is a Phase 14 polish item.
 func (b *Bot) handleStart(_ context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
-	body := fmt.Sprintf(
-		"Send me a file or text message — I'll save it and reply with a short share link.\n\n"+
-			"Links expire after %s. Only allowlisted Telegram accounts can use this bot.",
-		b.cfg.DefaultExpiry,
-	)
+	lang := b.resolveLang(msg)
+	body := fmt.Sprintf(i18n.T(lang, "bot.reply.start"), b.cfg.DefaultExpiry)
 	return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 }
 
@@ -70,10 +49,11 @@ func (b *Bot) handleStart(_ context.Context, msg *tgbotapi.Message) (tgbotapi.Me
 // belt-and-suspenders check keeps a routing regression from leaking a token
 // to a non-admin.
 func (b *Bot) handleWebLogin(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
-	userID, ok := b.admins[msg.From.ID]
+	entry, ok := b.admins[msg.From.ID]
 	if !ok {
 		return tgbotapi.MessageConfig{}, nil
 	}
+	lang := b.resolveLang(msg)
 
 	// Reject group/supergroup/channel chats before minting: the reply text
 	// embeds the one-time token URL, and the dispatcher would forward it to
@@ -81,23 +61,23 @@ func (b *Bot) handleWebLogin(ctx context.Context, msg *tgbotapi.Message) (tgbota
 	// other member. IsPrivate() is the positive form, so anything that isn't
 	// a private 1:1 chat falls through to the refusal.
 	if !msg.Chat.IsPrivate() {
-		return tgbotapi.NewMessage(msg.Chat.ID, webLoginNonPrivateReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.weblogin.nonprivate")), nil
 	}
 
-	token, err := b.authBotToken.CreateLoginToken(ctx, userID, webLoginTokenTTL)
+	token, err := b.authBotToken.CreateLoginToken(ctx, entry.userID, webLoginTokenTTL)
 	if errors.Is(err, auth.ErrRateLimited) {
-		return tgbotapi.NewMessage(msg.Chat.ID, webLoginRateLimitedReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.weblogin.ratelimited")), nil
 	}
 	if err != nil {
 		b.logger.ErrorContext(ctx, "create login token", "err", err, "telegram_id", msg.From.ID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
 	// TrimRight normalises a trailing slash on BaseURL so an operator
 	// setting BASE_URL=https://example.com/ doesn't produce a double-slashed
 	// login URL. Same reasoning as buildShareReply.
 	url := strings.TrimRight(b.cfg.BaseURL, "/") + "/auth/" + token
-	body := fmt.Sprintf("Login link (expires in 5 min):\n%s", url)
+	body := fmt.Sprintf(i18n.T(lang, "bot.reply.weblogin.link"), url)
 	reply := tgbotapi.NewMessage(msg.Chat.ID, body)
 	// DisableWebPagePreview blocks Telegram's server-side link-preview
 	// crawler from issuing GET /auth/{token} to render an unfurl card —
@@ -112,12 +92,8 @@ func (b *Bot) handleWebLogin(ctx context.Context, msg *tgbotapi.Message) (tgbota
 // handleStart with an extra line teasing the Phase 12 admin commands so users
 // know more surface is coming without us having to ship it in the MVP.
 func (b *Bot) handleHelp(_ context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
-	body := fmt.Sprintf(
-		"Send me a file or text message — I'll save it and reply with a short share link.\n\n"+
-			"Links expire after %s. Only allowlisted Telegram accounts can use this bot.\n\n"+
-			"Admin commands (/allow, /revoke, /users) come in a later phase.",
-		b.cfg.DefaultExpiry,
-	)
+	lang := b.resolveLang(msg)
+	body := fmt.Sprintf(i18n.T(lang, "bot.reply.help"), b.cfg.DefaultExpiry)
 	return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 }
 
@@ -133,24 +109,25 @@ func (b *Bot) handleHelp(_ context.Context, msg *tgbotapi.Message) (tgbotapi.Mes
 // against an accidental routing change leaking unauthorized writes into the
 // DB via this entrypoint.
 func (b *Bot) handleText(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
-	userID, ok := b.admins[msg.From.ID]
+	entry, ok := b.admins[msg.From.ID]
 	if !ok {
 		return tgbotapi.MessageConfig{}, nil
 	}
 	if msg.Text == "" {
 		return tgbotapi.MessageConfig{}, nil
 	}
+	lang := b.resolveLang(msg)
 
 	sh, err := b.share.CreateTextShare(ctx, share.CreateTextOpts{
-		UserID:  userID,
+		UserID:  entry.userID,
 		Content: msg.Text,
 	})
 	if err != nil {
 		b.logger.ErrorContext(ctx, "create text share", "err", err, "telegram_id", msg.From.ID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
-	return b.buildShareReply(msg.Chat.ID, share.KindText, "", 0, sh), nil
+	return b.buildShareReply(msg.Chat.ID, lang, share.KindText, "", 0, sh), nil
 }
 
 // handleDocument persists an attached file as a share and returns a success or
@@ -177,10 +154,11 @@ func (b *Bot) handleText(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.M
 // response, so it is correct even when Telegram omits FileSize.
 func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
 	doc := msg.Document
-	userID, ok := b.admins[msg.From.ID]
+	entry, ok := b.admins[msg.From.ID]
 	if !ok {
 		return tgbotapi.MessageConfig{}, nil
 	}
+	lang := b.resolveLang(msg)
 
 	if int64(doc.FileSize) > b.cfg.MaxUploadBytes {
 		b.logger.InfoContext(ctx, "document rejected: too large",
@@ -189,7 +167,7 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 			"size", doc.FileSize,
 			"max", b.cfg.MaxUploadBytes,
 		)
-		body := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		body := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge_predownload"), humanizeBytes(b.cfg.MaxUploadBytes))
 		return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 	}
 
@@ -200,13 +178,13 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 		// Error() includes the bot-token-bearing endpoint URL. Redact before
 		// logging (see bot.go's Send redaction for the same pattern).
 		b.logger.ErrorContext(ctx, "get file direct url", "err", redactURL(err), "file_id", doc.FileID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
 	body, size, err := b.downloader.Download(ctx, url)
 	if err != nil {
 		b.logger.ErrorContext(ctx, "download document", "err", err, "file_id", doc.FileID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 	defer body.Close()
 
@@ -222,7 +200,7 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 			"filename", doc.FileName,
 			"file_id", doc.FileID,
 		)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
 	// post-download size guard: the pre-download check relies on Telegram's
@@ -237,7 +215,7 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 			"size", size,
 			"max", b.cfg.MaxUploadBytes,
 		)
-		replyBody := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		replyBody := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge"), humanizeBytes(b.cfg.MaxUploadBytes))
 		return tgbotapi.NewMessage(msg.Chat.ID, replyBody), nil
 	}
 
@@ -257,7 +235,7 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 	}
 
 	sh, err := b.share.CreateFileShare(ctx, share.CreateFileOpts{
-		UserID:           userID,
+		UserID:           entry.userID,
 		OriginalFilename: filename,
 		MIMEType:         mimeType,
 		Size:             size,
@@ -265,10 +243,10 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 	})
 	if err != nil {
 		b.logger.ErrorContext(ctx, "create file share", "err", err, "telegram_id", msg.From.ID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
-	return b.buildShareReply(msg.Chat.ID, share.KindFile, filename, size, sh), nil
+	return b.buildShareReply(msg.Chat.ID, lang, share.KindFile, filename, size, sh), nil
 }
 
 // handlePhoto persists an attached photo as a share and returns a success or
@@ -287,10 +265,11 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 // gallery-path photo to JPEG regardless of the source format.
 func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.MessageConfig, error) {
 	photos := msg.Photo
-	userID, ok := b.admins[msg.From.ID]
+	entry, ok := b.admins[msg.From.ID]
 	if !ok {
 		return tgbotapi.MessageConfig{}, nil
 	}
+	lang := b.resolveLang(msg)
 
 	largest := photos[len(photos)-1]
 
@@ -301,7 +280,7 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 			"size", largest.FileSize,
 			"max", b.cfg.MaxUploadBytes,
 		)
-		body := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		body := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge_predownload"), humanizeBytes(b.cfg.MaxUploadBytes))
 		return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 	}
 
@@ -310,13 +289,13 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 		// see handleDocument for the redactURL rationale — same *url.Error
 		// token-leak hazard on transport failure.
 		b.logger.ErrorContext(ctx, "get file direct url", "err", redactURL(err), "file_id", largest.FileID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
 	body, size, err := b.downloader.Download(ctx, url)
 	if err != nil {
 		b.logger.ErrorContext(ctx, "download photo", "err", err, "file_id", largest.FileID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 	defer body.Close()
 
@@ -329,7 +308,7 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 			"file_unique_id", largest.FileUniqueID,
 			"file_id", largest.FileID,
 		)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
 	// post-download size guard — see handleDocument for the same pattern and
@@ -342,13 +321,13 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 			"size", size,
 			"max", b.cfg.MaxUploadBytes,
 		)
-		replyBody := fmt.Sprintf("That file is too large (max %s).", humanizeBytes(b.cfg.MaxUploadBytes))
+		replyBody := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge"), humanizeBytes(b.cfg.MaxUploadBytes))
 		return tgbotapi.NewMessage(msg.Chat.ID, replyBody), nil
 	}
 
 	filename := largest.FileUniqueID + ".jpg"
 	sh, err := b.share.CreateFileShare(ctx, share.CreateFileOpts{
-		UserID:           userID,
+		UserID:           entry.userID,
 		OriginalFilename: filename,
 		MIMEType:         "image/jpeg",
 		Size:             size,
@@ -356,10 +335,10 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 	})
 	if err != nil {
 		b.logger.ErrorContext(ctx, "create file share", "err", err, "telegram_id", msg.From.ID)
-		return tgbotapi.NewMessage(msg.Chat.ID, genericErrorReply), nil
+		return tgbotapi.NewMessage(msg.Chat.ID, i18n.T(lang, "bot.reply.error.generic")), nil
 	}
 
-	return b.buildShareReply(msg.Chat.ID, share.KindFile, filename, size, sh), nil
+	return b.buildShareReply(msg.Chat.ID, lang, share.KindFile, filename, size, sh), nil
 }
 
 // buildShareReply formats the ✓-prefixed success reply used by every
@@ -377,25 +356,29 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 // BASE_URL=https://example.com/ doesn't produce double-slashed share URLs
 // like https://example.com//abc12345. config.validateURL accepts the trailing
 // form, so the fix belongs here at the one consumption site.
-func (b *Bot) buildShareReply(chatID int64, kind, filename string, size int64, sh *share.Share) tgbotapi.MessageConfig {
+func (b *Bot) buildShareReply(chatID int64, lang, kind, filename string, size int64, sh *share.Share) tgbotapi.MessageConfig {
 	url := strings.TrimRight(b.cfg.BaseURL, "/") + "/" + sh.ID
 	var body string
 	switch kind {
 	case share.KindFile:
 		body = fmt.Sprintf(
-			"✓ Saved %s (%s). Link: %s\nExpires: %s",
+			i18n.T(lang, "bot.reply.share.file"),
 			filename, humanizeBytes(size), url, b.cfg.DefaultExpiry,
 		)
 	case share.KindText:
 		body = fmt.Sprintf(
-			"✓ Saved as text. Link: %s\nExpires: %s",
+			i18n.T(lang, "bot.reply.share.text"),
 			url, b.cfg.DefaultExpiry,
 		)
 	default:
 		// should-never-happen defense: a share.Kind value outside the two
 		// constants is a bug upstream, not something we want to silently
-		// render as an empty reply.
-		body = fmt.Sprintf("✓ Saved. Link: %s\nExpires: %s", url, b.cfg.DefaultExpiry)
+		// render as an empty reply. Reuse the text template as a safe fallback
+		// — it has no filename/size placeholders so the URL/expiry pair fits.
+		body = fmt.Sprintf(
+			i18n.T(lang, "bot.reply.share.text"),
+			url, b.cfg.DefaultExpiry,
+		)
 	}
 	return tgbotapi.NewMessage(chatID, body)
 }

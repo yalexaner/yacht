@@ -189,8 +189,8 @@ func TestBootstrapUsers_FreshDB(t *testing.T) {
 		if isAdmin != 1 {
 			t.Errorf("telegram_id=%d is_admin = %d, want 1", tgID, isAdmin)
 		}
-		if admins[tgID] != rowID {
-			t.Errorf("admins[%d] = %d, want %d (DB row id)", tgID, admins[tgID], rowID)
+		if admins[tgID].userID != rowID {
+			t.Errorf("admins[%d].userID = %d, want %d (DB row id)", tgID, admins[tgID].userID, rowID)
 		}
 	}
 }
@@ -225,9 +225,9 @@ func TestBootstrapUsers_PreExistingAdmin(t *testing.T) {
 	if got := countUserRows(t, handle); got != 2 {
 		t.Fatalf("users row count = %d, want 2 (no duplicates)", got)
 	}
-	if admins[preExisting] != originalID {
-		t.Errorf("admins[%d] = %d, want %d (original row preserved)",
-			preExisting, admins[preExisting], originalID)
+	if admins[preExisting].userID != originalID {
+		t.Errorf("admins[%d].userID = %d, want %d (original row preserved)",
+			preExisting, admins[preExisting].userID, originalID)
 	}
 }
 
@@ -391,7 +391,7 @@ func newTestBot(t *testing.T) *testBot {
 		dl:       dl,
 		db:       handle,
 		adminTG:  adminTG,
-		adminRow: admins[adminTG],
+		adminRow: admins[adminTG].userID,
 	}
 }
 
@@ -2023,12 +2023,243 @@ func TestBuildShareReply_TrimsBaseURLTrailingSlash(t *testing.T) {
 	tb.bot.cfg.BaseURL = "https://yacht.example/"
 
 	sh := &share.Share{ID: "abc12345"}
-	reply := tb.bot.buildShareReply(42, share.KindText, "", 0, sh)
+	reply := tb.bot.buildShareReply(42, "en", share.KindText, "", 0, sh)
 
 	if strings.Contains(reply.Text, "//abc12345") {
 		t.Errorf("reply.Text should not contain double slash before share id; got %q", reply.Text)
 	}
 	if !strings.Contains(reply.Text, "https://yacht.example/abc12345") {
 		t.Errorf("reply.Text missing normalised URL; got %q", reply.Text)
+	}
+}
+
+// setAdminLang overwrites the cached lang preference for the test admin so
+// resolveLang's first chain step (users.lang) can be exercised without
+// running a /lang/{code} round-trip.
+func setAdminLang(tb *testBot, lang string) {
+	entry := tb.bot.admins[tb.adminTG]
+	if lang == "" {
+		entry.lang = nil
+	} else {
+		v := lang
+		entry.lang = &v
+	}
+	tb.bot.admins[tb.adminTG] = entry
+}
+
+// TestResolveLang_AdminCacheWins confirms the highest-priority chain step:
+// a non-nil cached lang beats whatever LanguageCode the message carried.
+func TestResolveLang_AdminCacheWins(t *testing.T) {
+	tb := newTestBot(t)
+	setAdminLang(tb, "ru")
+
+	msg := &tgbotapi.Message{
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "en-US"},
+	}
+	if got := tb.bot.resolveLang(msg); got != "ru" {
+		t.Errorf("resolveLang = %q, want %q (cached users.lang must win over LanguageCode)", got, "ru")
+	}
+}
+
+// TestResolveLang_LanguageCodeFallback covers the second chain step: with
+// no cached preference, a Telegram-sent BCP-47 LanguageCode is matched
+// against the supported allowlist.
+func TestResolveLang_LanguageCodeFallback(t *testing.T) {
+	tb := newTestBot(t)
+
+	msg := &tgbotapi.Message{
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru-RU"},
+	}
+	if got := tb.bot.resolveLang(msg); got != "ru" {
+		t.Errorf("resolveLang = %q, want %q (LanguageCode must drive when cache is empty)", got, "ru")
+	}
+}
+
+// TestResolveLang_DefaultLangFallback covers the third chain step: with no
+// cached preference and no LanguageCode, cfg.DefaultLang wins.
+func TestResolveLang_DefaultLangFallback(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.DefaultLang = "ru"
+
+	msg := &tgbotapi.Message{
+		From: &tgbotapi.User{ID: tb.adminTG},
+	}
+	if got := tb.bot.resolveLang(msg); got != "ru" {
+		t.Errorf("resolveLang = %q, want %q (cfg.DefaultLang fallback)", got, "ru")
+	}
+}
+
+// TestResolveLang_UnsupportedCachedLang ensures a stale or out-of-allowlist
+// users.lang doesn't bypass the matcher chain — the lookup must skip step 1
+// and try step 2 (LanguageCode) instead.
+func TestResolveLang_UnsupportedCachedLang(t *testing.T) {
+	tb := newTestBot(t)
+	setAdminLang(tb, "zh") // unsupported — must be ignored
+
+	msg := &tgbotapi.Message{
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru-RU"},
+	}
+	if got := tb.bot.resolveLang(msg); got != "ru" {
+		t.Errorf("resolveLang = %q, want %q (unsupported cache must fall through to LanguageCode)", got, "ru")
+	}
+}
+
+// TestHandleStart_RendersRussian locks in the RU translation path for
+// /start: a Russian-locale Telegram client supplies LanguageCode="ru" and
+// the reply must come from bundleRU.
+func TestHandleStart_RendersRussian(t *testing.T) {
+	tb := newTestBot(t)
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru"},
+	}
+	reply, err := tb.bot.handleStart(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleStart: %v", err)
+	}
+	if !strings.Contains(reply.Text, "Пришлите мне файл") {
+		t.Errorf("reply.Text missing Russian welcome; got %q", reply.Text)
+	}
+}
+
+// TestHandleHelp_RendersRussian mirrors the start case for /help; locks in
+// that the help-specific extra line ("Команды администратора") flows
+// through the bundle correctly.
+func TestHandleHelp_RendersRussian(t *testing.T) {
+	tb := newTestBot(t)
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru"},
+	}
+	reply, err := tb.bot.handleHelp(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleHelp: %v", err)
+	}
+	if !strings.Contains(reply.Text, "Команды администратора") {
+		t.Errorf("reply.Text missing Russian admin-future notice; got %q", reply.Text)
+	}
+}
+
+// TestHandleText_RendersRussianSuccess covers the success-reply RU path —
+// "✓ Сохранено как текст." prefix must come through bundleRU.
+func TestHandleText_RendersRussianSuccess(t *testing.T) {
+	tb := newTestBot(t)
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42},
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru"},
+		Text: "привет",
+	}
+	reply, err := tb.bot.handleText(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleText: %v", err)
+	}
+	if !strings.Contains(reply.Text, "Сохранено как текст") {
+		t.Errorf("reply.Text missing Russian text-saved marker; got %q", reply.Text)
+	}
+}
+
+// TestHandleDocument_TooLargeRendersRussian locks in the RU pre-download
+// rejection — the user-facing copy must come from bundleRU when the
+// language resolves to ru.
+func TestHandleDocument_TooLargeRendersRussian(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.MaxUploadBytes = 100
+
+	doc := &tgbotapi.Document{
+		FileID:   "big_file_ru",
+		FileName: "big.bin",
+		FileSize: 1000,
+	}
+	msg := &tgbotapi.Message{
+		Chat:     &tgbotapi.Chat{ID: 42},
+		From:     &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru"},
+		Document: doc,
+	}
+
+	reply, err := tb.bot.handleDocument(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleDocument: %v", err)
+	}
+	if !strings.Contains(reply.Text, "слишком большой") {
+		t.Errorf("reply.Text missing Russian too-large notice; got %q", reply.Text)
+	}
+}
+
+// TestHandleWebLogin_RendersRussianLink confirms the /weblogin happy-path
+// reply uses the Russian link-preamble copy from bundleRU.
+func TestHandleWebLogin_RendersRussianLink(t *testing.T) {
+	tb := newTestBot(t)
+	tb.bot.cfg.BaseURL = "https://yacht.example"
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 42, Type: "private"},
+		From: &tgbotapi.User{ID: tb.adminTG, LanguageCode: "ru"},
+	}
+	reply, err := tb.bot.handleWebLogin(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("handleWebLogin: %v", err)
+	}
+	if !strings.Contains(reply.Text, "Ссылка для входа") {
+		t.Errorf("reply.Text missing Russian login-link preamble; got %q", reply.Text)
+	}
+	if !strings.Contains(reply.Text, "https://yacht.example/auth/") {
+		t.Errorf("reply.Text missing login URL; got %q", reply.Text)
+	}
+}
+
+// TestBootstrapUsers_LoadsLang locks in that bootstrapUsers populates the
+// adminEntry's lang from a pre-existing users.lang value — the bot must
+// see the web-set preference at startup so the bot reply uses the right
+// language without waiting for a LanguageCode hint.
+func TestBootstrapUsers_LoadsLang(t *testing.T) {
+	handle := newTestDB(t)
+	const tgID = int64(444444444)
+
+	if _, err := handle.ExecContext(
+		context.Background(),
+		`INSERT INTO users (telegram_id, is_admin, lang, created_at)
+		 VALUES (?, 1, 'ru', strftime('%s','now'))`,
+		tgID,
+	); err != nil {
+		t.Fatalf("seed users row: %v", err)
+	}
+
+	admins, err := bootstrapUsers(context.Background(), handle, []int64{tgID})
+	if err != nil {
+		t.Fatalf("bootstrapUsers: %v", err)
+	}
+	entry, ok := admins[tgID]
+	if !ok {
+		t.Fatalf("admins missing entry for telegram_id=%d", tgID)
+	}
+	if entry.lang == nil || *entry.lang != "ru" {
+		var got string
+		if entry.lang != nil {
+			got = *entry.lang
+		}
+		t.Errorf("entry.lang = %q, want %q", got, "ru")
+	}
+}
+
+// TestBootstrapUsers_NullLang confirms that NULL users.lang surfaces as a
+// nil pointer in the cache — resolveLang then falls through to the
+// LanguageCode chain step rather than treating "" as a forced default.
+func TestBootstrapUsers_NullLang(t *testing.T) {
+	handle := newTestDB(t)
+	const tgID = int64(555555555)
+
+	admins, err := bootstrapUsers(context.Background(), handle, []int64{tgID})
+	if err != nil {
+		t.Fatalf("bootstrapUsers: %v", err)
+	}
+	entry, ok := admins[tgID]
+	if !ok {
+		t.Fatalf("admins missing entry for telegram_id=%d", tgID)
+	}
+	if entry.lang != nil {
+		t.Errorf("entry.lang = %q, want nil (NULL column must read as nil)", *entry.lang)
 	}
 }

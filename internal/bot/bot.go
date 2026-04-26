@@ -20,6 +20,7 @@ import (
 
 	"github.com/yalexaner/yacht/internal/auth"
 	"github.com/yalexaner/yacht/internal/config"
+	"github.com/yalexaner/yacht/internal/i18n"
 	"github.com/yalexaner/yacht/internal/share"
 )
 
@@ -80,15 +81,27 @@ type Bot struct {
 	downloader fileDownloader
 	share      *share.Service
 	cfg        *config.Bot
-	// admins maps Telegram user ID → users.id row ID. Populated once at
-	// startup by bootstrapUsers from cfg.TelegramAdminIDs; read by the auth
-	// check and by handlers needing the FK-required users.id for new shares.
-	admins map[int64]int64
+	// admins maps Telegram user ID → adminEntry (users.id + cached lang
+	// preference). Populated once at startup by bootstrapUsers from
+	// cfg.TelegramAdminIDs; read by the auth check, share-creating
+	// handlers (need the FK-required users.id), and resolveLang. The cache
+	// is intentionally read-only after bootstrap — when web /lang/{code}
+	// updates users.lang, this cache is stale until bot restart.
+	// Documented as acceptable for personal scale.
+	admins map[int64]adminEntry
 	// authBotToken mints the one-time login tokens handed out by /weblogin.
 	// It is the bot-side entry point into the web-auth fallback flow, paired
 	// with the web handler that consumes them at GET /auth/{token}.
 	authBotToken *auth.BotToken
 	logger       *slog.Logger
+}
+
+// adminEntry is the per-admin cache row populated at startup. lang is a
+// pointer so a NULL users.lang column reads as "no preference recorded
+// yet" — resolveLang then falls through to msg.From.LanguageCode.
+type adminEntry struct {
+	userID int64
+	lang   *string
 }
 
 // New constructs a Bot wired to real Telegram (and, when downloader is nil,
@@ -298,25 +311,63 @@ func (b *Bot) handleUpdate(ctx context.Context, update tgbotapi.Update) {
 // enforces TELEGRAM_ADMIN_IDS being non-empty, but the bot package cannot
 // issue shares without at least one admin, so we fail loud rather than
 // construct a bot that silently rejects every message.
-func bootstrapUsers(ctx context.Context, db *sql.DB, adminIDs []int64) (map[int64]int64, error) {
+func bootstrapUsers(ctx context.Context, db *sql.DB, adminIDs []int64) (map[int64]adminEntry, error) {
 	if len(adminIDs) == 0 {
 		return nil, errors.New("bootstrapUsers: adminIDs is empty")
 	}
 
+	// RETURNING includes lang so resolveLang can prefer the user's recorded
+	// preference (set via web /lang/{code}) over the message's LanguageCode
+	// hint. The column is nullable; a fresh upsert returns NULL until the
+	// admin picks a language on the web.
 	const upsertSQL = `INSERT INTO users (telegram_id, is_admin, created_at)
 VALUES (?, 1, strftime('%s','now'))
 ON CONFLICT(telegram_id) DO UPDATE SET is_admin = 1
-RETURNING id`
+RETURNING id, lang`
 
-	admins := make(map[int64]int64, len(adminIDs))
+	admins := make(map[int64]adminEntry, len(adminIDs))
 	for _, tgID := range adminIDs {
-		var rowID int64
-		if err := db.QueryRowContext(ctx, upsertSQL, tgID).Scan(&rowID); err != nil {
+		var (
+			rowID int64
+			lang  sql.NullString
+		)
+		if err := db.QueryRowContext(ctx, upsertSQL, tgID).Scan(&rowID, &lang); err != nil {
 			return nil, fmt.Errorf("bootstrapUsers: upsert telegram_id=%d: %w", tgID, err)
 		}
-		admins[tgID] = rowID
+		entry := adminEntry{userID: rowID}
+		if lang.Valid {
+			s := lang.String
+			entry.lang = &s
+		}
+		admins[tgID] = entry
 	}
 	return admins, nil
+}
+
+// resolveLang picks the language to use for a reply to msg. Chain mirrors
+// the SPEC § Bot priority order:
+//
+//  1. cached users.lang from the admin map (set via web /lang/{code})
+//  2. msg.From.LanguageCode parsed via the i18n matcher (Telegram sends
+//     BCP-47-ish codes; the matcher reduces them to the supported set)
+//  3. cfg.DefaultLang as the operator-chosen final fallback
+//
+// The defensive default ("en") fires only if msg.From is nil — which the
+// handleUpdate dispatcher already filters — so it is belt-and-suspenders
+// against a routing change reaching here without that guard.
+func (b *Bot) resolveLang(msg *tgbotapi.Message) string {
+	if msg != nil && msg.From != nil {
+		if entry, ok := b.admins[msg.From.ID]; ok && entry.lang != nil && i18n.IsSupported(*entry.lang) {
+			return *entry.lang
+		}
+		if msg.From.LanguageCode != "" {
+			return i18n.MatchAcceptLanguage(msg.From.LanguageCode)
+		}
+	}
+	if b.cfg != nil && b.cfg.DefaultLang != "" && i18n.IsSupported(b.cfg.DefaultLang) {
+		return b.cfg.DefaultLang
+	}
+	return "en"
 }
 
 // botTokenRegex matches the `bot<id>:<secret>` fragment that appears in every
