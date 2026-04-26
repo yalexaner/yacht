@@ -5,7 +5,10 @@
 
 <div class="share-url">
   <input id="share-url-input" type="text" value="{{.ShareURL}}" readonly>
-  <button id="copy-btn" type="button" data-copy-text="{{.ShareURL}}">{{ T .Lang "button.copy" }}</button>
+  <button id="copy-btn" type="button"
+          data-copy-text="{{.ShareURL}}"
+          data-copy-success-text="{{ T .Lang "js.copy.success" }}"
+          data-copy-failed-text="{{ T .Lang "js.copy.failed" }}">{{ T .Lang "button.copy" }}</button>
 </div>
 
 {{if eq .Kind "file"}}

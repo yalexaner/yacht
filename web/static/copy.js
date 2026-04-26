@@ -1,8 +1,14 @@
 // copy.js drives the "Copy" button on /shares/{id}/created: one click puts
-// the share URL on the user's clipboard and flips the button label to
-// "Copied!" for 1.5s as feedback. Pure progressive enhancement — without
-// JS, the URL still sits in a readonly <input> the operator can select and
-// copy by hand.
+// the share URL on the user's clipboard and flips the button label to the
+// localized success string for 1.5s as feedback. Pure progressive
+// enhancement — without JS, the URL still sits in a readonly <input> the
+// operator can select and copy by hand.
+//
+// Localized button labels arrive from the template via data-* attributes
+// (data-copy-success-text, data-copy-failed-text) so this script stays
+// language-agnostic. If either attribute is missing we leave the button
+// label unchanged rather than introduce an English literal — the clipboard
+// op still ran, and templates always set both attributes in practice.
 //
 // We try navigator.clipboard.writeText first (the modern, async API). It
 // can reject for two practical reasons: the page is served over plain HTTP
@@ -37,7 +43,7 @@
         // hand instead of silently swallowing it — the readonly input
         // next to the button still holds the URL.
         var prev = btn.textContent;
-        btn.textContent = 'Copy failed';
+        btn.textContent = btn.dataset.copyFailedText || prev;
         setTimeout(function () { btn.textContent = prev; }, 1500);
       });
     });
@@ -84,7 +90,7 @@
 
   function flash(btn) {
     var prev = btn.textContent;
-    btn.textContent = 'Copied!';
+    btn.textContent = btn.dataset.copySuccessText || prev;
     btn.classList.add('copied');
     setTimeout(function () {
       btn.textContent = prev;

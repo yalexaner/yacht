@@ -1096,6 +1096,36 @@ func TestStatic_ServesCopyJS(t *testing.T) {
 	}
 }
 
+// TestStaticAssets_CopyJSReadsDataAttrs guards the Phase 11 i18n contract
+// for the Copy button: the script must take its success / failure labels
+// from data-copy-success-text and data-copy-failed-text on the button
+// element, never from hardcoded English literals. share_created.html sets
+// the attributes via i18n.T, so a regression here would silently re-pin
+// the button feedback to English regardless of the user's language.
+func TestStaticAssets_CopyJSReadsDataAttrs(t *testing.T) {
+	srv, _ := newUploadTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/static/copy.js", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	for _, want := range []string{"copySuccessText", "copyFailedText"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("copy.js missing dataset read for %q; got:\n%s", want, body)
+		}
+	}
+	for _, banned := range []string{"'Copied!'", `"Copied!"`, "'Copy failed'", `"Copy failed"`} {
+		if strings.Contains(body, banned) {
+			t.Errorf("copy.js still contains hardcoded English literal %q; got:\n%s", banned, body)
+		}
+	}
+}
+
 // TestUploadSubmit_TooLarge: a body exceeding MaxUploadBytes + headroom
 // must surface as a friendly 413 with the upload form re-rendered, not a
 // generic 500 or a hung connection. MaxBytesReader trips on read inside
