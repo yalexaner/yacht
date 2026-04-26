@@ -79,7 +79,7 @@ func TestHome_RendersForAuthenticatedUser(t *testing.T) {
 	userID := insertHomeTestAdmin(t, handle, "Ada Lovelace")
 
 	sessionID, err := auth.CreateSession(
-		context.Background(), handle, userID, "test", 30*24*time.Hour,
+		context.Background(), handle, userID, "telegram_widget", 30*24*time.Hour,
 	)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)

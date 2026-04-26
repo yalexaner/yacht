@@ -111,7 +111,7 @@ func insertUploadTestAdmin(t *testing.T, handle *sql.DB) int64 {
 func uploadTestSession(t *testing.T, handle *sql.DB, userID int64) string {
 	t.Helper()
 	sessionID, err := auth.CreateSession(
-		context.Background(), handle, userID, "test", 30*24*time.Hour,
+		context.Background(), handle, userID, "telegram_widget", 30*24*time.Hour,
 	)
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
