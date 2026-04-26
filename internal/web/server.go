@@ -116,6 +116,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /auth/{token}", s.botTokenHandler)
 	mux.HandleFunc("POST /logout", s.logoutHandler)
 
+	// Anonymous-friendly: the language switcher must work for first-time
+	// visitors who haven't logged in yet. langHandler resolves the
+	// session cookie inline (best-effort) so an authenticated visitor
+	// also gets users.lang persisted.
+	mux.HandleFunc("GET /lang/{code}", s.langHandler)
+
 	// GET / is gated behind RequireAuth so the post-login redirect lands
 	// somewhere meaningful: an authed visitor sees the placeholder home,
 	// an unauthed one is bounced back to /login by the middleware (which

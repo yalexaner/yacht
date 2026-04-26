@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/yalexaner/yacht/internal/auth"
+	"github.com/yalexaner/yacht/internal/i18n"
 	"github.com/yalexaner/yacht/internal/share"
 	"github.com/yalexaner/yacht/internal/storage"
 	"github.com/yalexaner/yacht/internal/web/middleware"
@@ -35,6 +37,21 @@ const shareCookieMaxAge = 5 * time.Minute
 // magnitude above any legitimate password submission and leaves no room for
 // mistakes when the form gains fields in later phases.
 const passwordFormMaxBytes = 4 * 1024
+
+// langCookieName is the cookie the language switcher writes and the lang
+// middleware reads. Hard-coded (not config-driven) because the value is also
+// the public face of /lang/{code} — flipping the name would mean coordinated
+// changes in templates, JS, and the middleware default, with no operator
+// upside.
+const langCookieName = "yacht_lang"
+
+// langCookieMaxAge bounds the language preference cookie's lifetime. One year
+// matches the SPEC's "the user picked a language, remember it" intent — the
+// preference is sticky enough that a returning visitor weeks later still sees
+// their last pick without being forced through the switcher again. For a
+// logged-in user, users.lang carries the preference past cookie expiry, so
+// the cookie length is really a UX knob for anonymous visitors.
+const langCookieMaxAge = 365 * 24 * time.Hour
 
 // fileShareView is the data contract between shareHandler and
 // share_file.html. Handlers precompute Filename/Size/ExpiresAt as plain
@@ -808,6 +825,122 @@ func (s *Server) logoutHandler(w http.ResponseWriter, r *http.Request) {
 		Secure:   requestIsTLS(r),
 	})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// langHandler serves GET /lang/{code}: the explicit language switcher
+// endpoint. Anonymous-friendly so a first-time visitor can flip languages
+// before logging in; authenticated visitors additionally have their pick
+// mirrored into users.lang so the preference survives a cookie clear.
+//
+// Failure modes:
+//
+//   - Unknown code → 400 via renderError. Never trust path-supplied lang
+//     values: an attacker who plants a yacht_lang cookie with a junk value
+//     would otherwise leak it through the middleware's IsSupported guard
+//     ignoring it; rejecting at the handler keeps junk out of the cookie
+//     jar entirely.
+//   - DB write failure on the users.lang update → logged at WARN and
+//     swallowed. The visitor's primary intent (cookie set + redirect) has
+//     already succeeded; surfacing a 500 here would make a transient DB
+//     hiccup look like a broken language switcher.
+//
+// Open-redirect guard: the redirect target is computed from r.Referer()
+// only when the parsed URL's host matches r.Host (or is absent — a bare
+// path Referer). Any cross-origin or unparseable Referer collapses to "/"
+// so an attacker who lures a logged-in user into clicking
+// /lang/ru?... from an external page cannot use the lang endpoint as a
+// generic open-redirect.
+func (s *Server) langHandler(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	if !i18n.IsSupported(code) {
+		s.renderError(w, http.StatusBadRequest, "Bad Request", "Unsupported language.")
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     langCookieName,
+		Value:    code,
+		Path:     "/",
+		MaxAge:   int(langCookieMaxAge.Seconds()),
+		HttpOnly: true,
+		// Lax (not Strict) so the cookie survives a top-level navigation
+		// from another origin — clicking a /lang/ru link in an email or
+		// chat must still set the cookie. Strict would drop it for those
+		// flows and produce a confusing "the switcher does nothing"
+		// experience.
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsTLS(r),
+	})
+
+	if user := s.userFromSessionCookie(r); user != nil {
+		// Best-effort persistence: a DB hiccup must not block the
+		// redirect. The cookie is already set, so the visitor's intent
+		// has been honoured for the current browser; the persisted
+		// preference catches up the next time they log in or roll the
+		// cookie over.
+		if _, err := s.db.ExecContext(r.Context(),
+			`UPDATE users SET lang = ? WHERE id = ?`, code, user.ID); err != nil {
+			s.logger.Warn("update users.lang", "user_id", user.ID, "err", err)
+		}
+	}
+
+	http.Redirect(w, r, safeRedirectFromReferer(r), http.StatusSeeOther)
+}
+
+// userFromSessionCookie best-effort resolves the request's session cookie
+// to a hydrated *auth.User. Returns nil for any failure (missing cookie,
+// expired session, stale row, DB fault) — every nil-return path is
+// equivalent from langHandler's perspective: "no user to update, just set
+// the cookie and continue". Pulled out as a method so future
+// anonymous-friendly routes that want the same best-effort lookup can
+// reuse the contract without re-implementing the cookie/parse/lookup
+// dance.
+func (s *Server) userFromSessionCookie(r *http.Request) *auth.User {
+	if s.cfg == nil || s.cfg.SessionCookieName == "" {
+		return nil
+	}
+	c, err := r.Cookie(s.cfg.SessionCookieName)
+	if err != nil || c.Value == "" {
+		return nil
+	}
+	user, err := auth.GetSession(r.Context(), s.db, c.Value)
+	if err != nil {
+		return nil
+	}
+	return user
+}
+
+// safeRedirectFromReferer returns a path-only redirect target derived from
+// the Referer header, or "/" when the referer is missing, unparseable, or
+// cross-origin. The open-redirect guard compares the parsed URL's host
+// against r.Host — an external host (or a Referer we cannot parse at all)
+// collapses to "/" so the lang endpoint cannot be used as a generic
+// open-redirect.
+//
+// The returned target is path+query only (never scheme+host) so even a
+// same-origin Referer never leaks into the Location header as an absolute
+// URL — keeping things relative also makes the response survive a reverse
+// proxy that rewrites scheme/host.
+func safeRedirectFromReferer(r *http.Request) string {
+	ref := r.Referer()
+	if ref == "" {
+		return "/"
+	}
+	u, err := url.Parse(ref)
+	if err != nil {
+		return "/"
+	}
+	if u.Host != "" && u.Host != r.Host {
+		return "/"
+	}
+	target := u.Path
+	if target == "" {
+		return "/"
+	}
+	if u.RawQuery != "" {
+		target += "?" + u.RawQuery
+	}
+	return target
 }
 
 // healthzHandler is the liveness probe: no DB ping, no storage ping, just
