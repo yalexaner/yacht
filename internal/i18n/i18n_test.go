@@ -98,3 +98,27 @@ func TestMatchAcceptLanguage_Empty(t *testing.T) {
 		t.Fatalf("MatchAcceptLanguage(\"\") = %q, want default %q", got, "en")
 	}
 }
+
+// TestBundle_RUKeysMatchEN guards against translation drift: every key in the
+// English bundle must have a counterpart in the Russian one, otherwise the
+// fallback path silently surfaces English strings inside an otherwise-Russian
+// page. Missing keys fail loud here long before they reach a user.
+func TestBundle_RUKeysMatchEN(t *testing.T) {
+	for key := range bundleEN {
+		if _, ok := bundleRU[key]; !ok {
+			t.Errorf("bundleRU missing key %q (present in bundleEN)", key)
+		}
+	}
+}
+
+// TestBundle_NoOrphanKeysInRU is the inverse of TestBundle_RUKeysMatchEN: a
+// key in bundleRU with no English counterpart is almost certainly a typo
+// (the renamed-EN-key, stale-RU-copy pattern). Catching it here keeps dead
+// keys from accumulating in the Russian map across phases.
+func TestBundle_NoOrphanKeysInRU(t *testing.T) {
+	for key := range bundleRU {
+		if _, ok := bundleEN[key]; !ok {
+			t.Errorf("bundleRU has orphan key %q (no counterpart in bundleEN)", key)
+		}
+	}
+}
