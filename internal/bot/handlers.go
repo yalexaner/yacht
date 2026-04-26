@@ -167,7 +167,7 @@ func (b *Bot) handleDocument(ctx context.Context, msg *tgbotapi.Message) (tgbota
 			"size", doc.FileSize,
 			"max", b.cfg.MaxUploadBytes,
 		)
-		body := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge_predownload"), humanizeBytes(b.cfg.MaxUploadBytes))
+		body := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge"), humanizeBytes(b.cfg.MaxUploadBytes))
 		return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 	}
 
@@ -280,7 +280,7 @@ func (b *Bot) handlePhoto(ctx context.Context, msg *tgbotapi.Message) (tgbotapi.
 			"size", largest.FileSize,
 			"max", b.cfg.MaxUploadBytes,
 		)
-		body := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge_predownload"), humanizeBytes(b.cfg.MaxUploadBytes))
+		body := fmt.Sprintf(i18n.T(lang, "bot.reply.error.filetoolarge"), humanizeBytes(b.cfg.MaxUploadBytes))
 		return tgbotapi.NewMessage(msg.Chat.ID, body), nil
 	}
 

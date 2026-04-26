@@ -14,13 +14,9 @@ var bundleEN = map[string]string{
 	"button.logout":          "Log out",
 	"button.unlock":          "Unlock",
 
-	// Bot replies. The two filetoolarge variants share text today but split
-	// because the pre-download (Telegram-metadata) and post-download
-	// (Content-Length) checks are independent failure modes worth reporting
-	// separately if copy ever diverges.
-	"bot.reply.error.filetoolarge":             "That file is too large (max %s).",
-	"bot.reply.error.filetoolarge_predownload": "That file is too large (max %s).",
-	"bot.reply.error.generic":                  "Something went wrong. Try again in a moment.",
+	// Bot replies.
+	"bot.reply.error.filetoolarge": "That file is too large (max %s).",
+	"bot.reply.error.generic":      "Something went wrong. Try again in a moment.",
 	"bot.reply.help": "Send me a file or text message — I'll save it and reply with a short share link.\n\n" +
 		"Links expire after %s. Only allowlisted Telegram accounts can use this bot.\n\n" +
 		"Admin commands (/allow, /revoke, /users) come in a later phase.",
@@ -78,9 +74,11 @@ var bundleEN = map[string]string{
 	"form.upload.option.file":    "File",
 	"form.upload.option.text":    "Text",
 
-	// JS feedback strings injected via data-* attributes on the copy button.
-	"js.copy.failed":  "Copy failed",
-	"js.copy.success": "Copied!",
+	// JS feedback strings injected via data-* attributes on the copy button
+	// and the upload form (XHR error banner).
+	"js.copy.failed":    "Copy failed",
+	"js.copy.success":   "Copied!",
+	"js.upload.failed":  "Upload failed — please check your connection and try again.",
 
 	// Page chrome (titles + headings + per-page body strings). Keys carry
 	// the page name so a future template addition only touches its own

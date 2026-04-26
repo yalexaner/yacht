@@ -112,9 +112,13 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.static))))
 
 	mux.Handle("GET /login", s.lang()(http.HandlerFunc(s.loginHandler)))
-	mux.HandleFunc("GET /auth/telegram/callback", s.telegramCallbackHandler)
-	mux.HandleFunc("GET /auth/{token}", s.botTokenHandler)
-	mux.HandleFunc("POST /logout", s.logoutHandler)
+	// Auth callbacks render error templates on failure (renderError →
+	// error.html), so they need lang resolution too — without the
+	// middleware those error pages would always come out in English even
+	// when the visitor has yacht_lang=ru set.
+	mux.Handle("GET /auth/telegram/callback", s.lang()(http.HandlerFunc(s.telegramCallbackHandler)))
+	mux.Handle("GET /auth/{token}", s.lang()(http.HandlerFunc(s.botTokenHandler)))
+	mux.Handle("POST /logout", s.lang()(http.HandlerFunc(s.logoutHandler)))
 
 	// Anonymous-friendly: the language switcher must work for first-time
 	// visitors who haven't logged in yet. langHandler resolves the

@@ -117,14 +117,17 @@ type loginView struct {
 }
 
 // expiryOption is one entry in the upload form's "Expires after" dropdown.
+// BundleKey is the i18n lookup key (form.upload.expiry.NNN); the template
+// resolves it via {{ T $.Lang .BundleKey }} so the visible label translates.
+// Seconds is the canonical wire value validated by the POST handler.
 // Seconds is what the form posts back; Label is what the operator sees.
 // Stored as int64 (not time.Duration) because the form value is a string of
 // decimal seconds — keeping the same units on both sides means the template
 // renders raw integers and the server parses them with strconv.ParseInt
 // without a unit conversion in the middle.
 type expiryOption struct {
-	Label   string
-	Seconds int64
+	BundleKey string
+	Seconds   int64
 }
 
 // expiryOptions is the allowlist of expiry durations the upload form offers
@@ -133,12 +136,12 @@ type expiryOption struct {
 // the list is rejected. Keeping the list in code (not config) means a future
 // "1 year" option needs a deliberate code change rather than a stray env var.
 var expiryOptions = []expiryOption{
-	{Label: "1 hour", Seconds: 3600},
-	{Label: "6 hours", Seconds: 21600},
-	{Label: "24 hours", Seconds: 86400},
-	{Label: "3 days", Seconds: 259200},
-	{Label: "7 days", Seconds: 604800},
-	{Label: "30 days", Seconds: 2592000},
+	{BundleKey: "form.upload.expiry.1h", Seconds: 3600},
+	{BundleKey: "form.upload.expiry.6h", Seconds: 21600},
+	{BundleKey: "form.upload.expiry.24h", Seconds: 86400},
+	{BundleKey: "form.upload.expiry.3d", Seconds: 259200},
+	{BundleKey: "form.upload.expiry.7d", Seconds: 604800},
+	{BundleKey: "form.upload.expiry.30d", Seconds: 2592000},
 }
 
 // uploadFormView feeds upload.html. ExpiryOptions is the dropdown allowlist;
@@ -955,6 +958,13 @@ func safeRedirectFromReferer(r *http.Request) string {
 	}
 	target := u.Path
 	if target == "" {
+		return "/"
+	}
+	// Defense-in-depth: a Referer with no host (e.g. "//evil.com/x" or
+	// "/\evil.com") parses with empty Host and a path that some browsers
+	// historically resolved as a network-relative URL. Reject any path that
+	// would let the Location header escape the current origin.
+	if strings.HasPrefix(target, "//") || strings.HasPrefix(target, `/\`) {
 		return "/"
 	}
 	if u.RawQuery != "" {

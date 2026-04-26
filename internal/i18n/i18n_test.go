@@ -1,6 +1,9 @@
 package i18n
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // withTestBundle swaps the package bundle for the test's duration so the
 // lookup tests assert against well-known fixtures instead of the real
@@ -120,5 +123,41 @@ func TestBundle_NoOrphanKeysInRU(t *testing.T) {
 		if _, ok := bundleEN[key]; !ok {
 			t.Errorf("bundleRU has orphan key %q (no counterpart in bundleEN)", key)
 		}
+	}
+}
+
+// TestBundle_PlaceholderParity guards against fmt.Sprintf misuse: every
+// %s/%d/%v placeholder in an EN value must appear the same number of times
+// in the matching RU value. A translator who drops a %s in the Russian
+// rendering of "Saved %s (%s). Link: %s" silently produces malformed output
+// when the bot formats the reply.
+func TestBundle_PlaceholderParity(t *testing.T) {
+	verbs := []string{"%s", "%d", "%v"}
+	for key, en := range bundleEN {
+		ru, ok := bundleRU[key]
+		if !ok {
+			continue
+		}
+		for _, verb := range verbs {
+			if got, want := strings.Count(ru, verb), strings.Count(en, verb); got != want {
+				t.Errorf("bundleRU[%q] has %d %q placeholder(s), want %d (matches bundleEN value)", key, got, verb, want)
+			}
+		}
+	}
+}
+
+// TestBundle_T_PreservesPlaceholders confirms T returns its bundle entry
+// verbatim — without escaping or stripping the %s/%d markers callers depend
+// on for fmt.Sprintf at the call site.
+func TestBundle_T_PreservesPlaceholders(t *testing.T) {
+	withTestBundle(t, map[string]map[string]string{
+		"en": {"templated": "Hello %s, you have %d messages."},
+		"ru": {"templated": "Привет, %s, у вас %d сообщений."},
+	})
+	if got, want := T("en", "templated"), "Hello %s, you have %d messages."; got != want {
+		t.Errorf("T(en, templated) = %q, want %q", got, want)
+	}
+	if got, want := T("ru", "templated"), "Привет, %s, у вас %d сообщений."; got != want {
+		t.Errorf("T(ru, templated) = %q, want %q", got, want)
 	}
 }

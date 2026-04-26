@@ -105,7 +105,11 @@
         if (percent) percent.hidden = true;
         var banner = document.createElement('p');
         banner.className = 'form-error';
-        banner.textContent = 'Upload failed — please check your connection and try again.';
+        // Translation rides on a data-* attribute set by upload.html so the
+        // JS file stays language-agnostic. Fall back to the existing form
+        // header text if the attribute is missing — matches copy.js's
+        // "no English literal in JS" stance.
+        banner.textContent = form.dataset.uploadFailedText || '';
         form.parentNode.insertBefore(banner, form);
       };
 

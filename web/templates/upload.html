@@ -2,7 +2,7 @@
 {{define "content"}}
 <h1>{{ T .Lang "page.upload.heading" }}</h1>
 {{if .Error}}<p class="form-error">{{.Error}}</p>{{end}}
-<form method="post" action="/upload" enctype="multipart/form-data">
+<form method="post" action="/upload" enctype="multipart/form-data" data-upload-failed-text="{{ T .Lang "js.upload.failed" }}">
   {{/*
     Field order is load-bearing (Phase 10 plan, decision #2). Non-file fields
     must precede the file <input> so they arrive first in the multipart
@@ -25,7 +25,7 @@
     {{ T .Lang "form.upload.label.expiry" }}
     <select name="expiry">
       {{range .ExpiryOptions}}
-      <option value="{{.Seconds}}"{{if eq .Seconds $.DefaultExpirySeconds}} selected{{end}}>{{.Label}}</option>
+      <option value="{{.Seconds}}"{{if eq .Seconds $.DefaultExpirySeconds}} selected{{end}}>{{ T $.Lang .BundleKey }}</option>
       {{end}}
     </select>
   </label>

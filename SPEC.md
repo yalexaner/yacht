@@ -53,6 +53,7 @@ Out of scope:
 - **ID generation:** `github.com/matoous/go-nanoid/v2` (8 chars for share IDs)
 - **Password hashing:** `golang.org/x/crypto/bcrypt`
 - **R2/S3 client:** `github.com/aws/aws-sdk-go-v2` with S3 client pointed at R2 endpoint
+- **i18n matcher:** `golang.org/x/text/language` (BCP-47 matching for `Accept-Language` and bot `LanguageCode`)
 - **No ORM.** Raw SQL via `database/sql`.
 - **No router framework.** Standard library mux.
 
@@ -143,7 +144,8 @@ CREATE TABLE users (
     telegram_username TEXT,
     display_name TEXT,
     is_admin INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    lang TEXT                              -- null = not yet chosen, fall back to Accept-Language / LanguageCode
 );
 
 CREATE TABLE shares (
@@ -288,10 +290,17 @@ Below the widget, in muted text:
 - Russian (`ru`)
 - Default: English (configurable via env `DEFAULT_LANG`)
 
-### Detection priority
+### Web detection priority
 
-1. `yacht_lang` cookie (explicit user choice)
-2. `Accept-Language` header
+1. `yacht_lang` cookie (explicit user choice, validated against the `{en, ru}` allowlist; unknown values are ignored)
+2. `users.lang` from the authenticated session (only fires when `RequireAuth` ran upstream)
+3. `Accept-Language` header (matched via `golang.org/x/text/language.MatchStrings`)
+4. `DEFAULT_LANG` env var
+
+### Bot detection priority
+
+1. `users.lang` from the in-memory admin map loaded at bot startup (stale until restart — documented tradeoff)
+2. `msg.From.LanguageCode` matched against `{en, ru}` via `golang.org/x/text/language.MatchStrings`
 3. `DEFAULT_LANG` env var
 
 ### Switcher UI
@@ -304,11 +313,17 @@ Below the widget, in muted text:
 
 ### Implementation
 
-- Inline Go map at start (`internal/i18n/i18n.go`)
-- `T(lang, key string) string` lookup with fallback to English
-- Templates: `{{ T .Lang "key.path" }}`
-- Server endpoint `GET /lang/{code}` sets cookie, redirects to Referer
-- Migrate to JSON files when string count exceeds ~30
+- Bundle split across `internal/i18n/{i18n.go, en.go, ru.go}`. `i18n.go` holds the package surface (`T`, `IsSupported`, `MatchAcceptLanguage`, `Languages`); `en.go` / `ru.go` hold per-language `map[string]string` bundles.
+- Keys use a flat dotted convention `domain.subject.detail` (e.g. `page.login.title`, `bot.reply.help`, `error.share.expired`, `button.copy`).
+- `T(lang, key string) string` returns the bundle entry, falls back to English, falls back to the key string itself (visible miss).
+- `T` does not format — placeholders ride as printf-style `%s`/`%d` and callers `fmt.Sprintf` the returned string at the call site.
+- Templates: `{{ T .Lang "key.path" }}` (the function is registered in `parseTemplates`).
+- Server endpoint `GET /lang/{code}`:
+  - Validates `code` against `i18n.IsSupported`; rejects with 400 on unknown codes.
+  - Sets cookie `yacht_lang` (Path=/, MaxAge=1y, HttpOnly, SameSite=Lax, Secure conditional on TLS).
+  - For authenticated visitors, also `UPDATE users SET lang = ? WHERE id = ?` best-effort — a DB error is logged and the cookie/redirect still go through.
+  - Redirects to a same-origin `Referer` (open-redirect guard) or `/`.
+- Migrate to JSON files when string count exceeds ~30 (deferred to Phase 14 — currently 54 keys live in the Go maps).
 
 ### Strings to translate
 

@@ -17,9 +17,8 @@ var bundleRU = map[string]string{
 	// Bot replies. Plurals on "час/часа/часов" etc. are handled at the bundle
 	// layer for the small fixed set we ship; full ICU plural forms are a
 	// Phase 14 concern.
-	"bot.reply.error.filetoolarge":             "Файл слишком большой (максимум %s).",
-	"bot.reply.error.filetoolarge_predownload": "Файл слишком большой (максимум %s).",
-	"bot.reply.error.generic":                  "Что-то пошло не так. Попробуйте ещё раз через минуту.",
+	"bot.reply.error.filetoolarge": "Файл слишком большой (максимум %s).",
+	"bot.reply.error.generic":      "Что-то пошло не так. Попробуйте ещё раз через минуту.",
 	"bot.reply.help": "Пришлите мне файл или текстовое сообщение — я сохраню его и отвечу короткой ссылкой.\n\n" +
 		"Ссылки действуют %s. Пользоваться ботом могут только аккаунты Telegram из белого списка.\n\n" +
 		"Команды администратора (/allow, /revoke, /users) появятся в одной из следующих фаз.",
@@ -77,9 +76,11 @@ var bundleRU = map[string]string{
 	"form.upload.option.file":    "Файл",
 	"form.upload.option.text":    "Текст",
 
-	// JS feedback strings injected via data-* attributes on the copy button.
-	"js.copy.failed":  "Не удалось скопировать",
-	"js.copy.success": "Скопировано!",
+	// JS feedback strings injected via data-* attributes on the copy button
+	// and the upload form (XHR error banner).
+	"js.copy.failed":    "Не удалось скопировать",
+	"js.copy.success":   "Скопировано!",
+	"js.upload.failed":  "Не удалось загрузить — проверьте соединение и попробуйте ещё раз.",
 
 	// Page chrome. Login fallback body matches the SPEC's drafted RU text
 	// verbatim, segmented to leave the template room to render the bot

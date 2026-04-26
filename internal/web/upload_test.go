@@ -1126,6 +1126,32 @@ func TestStaticAssets_CopyJSReadsDataAttrs(t *testing.T) {
 	}
 }
 
+// TestStaticAssets_UploadJSReadsDataAttrs mirrors the copy.js i18n contract
+// for the upload form's XHR error banner: the script must take the failure
+// label from form.dataset.uploadFailedText (set by upload.html via i18n.T)
+// rather than a hardcoded English literal.
+func TestStaticAssets_UploadJSReadsDataAttrs(t *testing.T) {
+	srv, _ := newUploadTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/static/upload.js", nil)
+	rec := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200, got %d; body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "uploadFailedText") {
+		t.Errorf("upload.js missing dataset read for uploadFailedText; got:\n%s", body)
+	}
+	for _, banned := range []string{"'Upload failed", `"Upload failed`} {
+		if strings.Contains(body, banned) {
+			t.Errorf("upload.js still contains hardcoded English literal %q; got:\n%s", banned, body)
+		}
+	}
+}
+
 // TestUploadSubmit_TooLarge: a body exceeding MaxUploadBytes + headroom
 // must surface as a friendly 413 with the upload form re-rendered, not a
 // generic 500 or a hung connection. MaxBytesReader trips on read inside
