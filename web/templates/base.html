@@ -4,9 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{{block "title" .}}{{ T .Lang "page.default.title" }}{{end}}</title>
+  <link rel="alternate" hreflang="en" href="/">
+  <link rel="alternate" hreflang="ru" href="/">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <div class="lang-switcher">
+    {{ if eq .Lang "ru" }}
+      <span class="lang-active">Русский</span>
+    {{ else }}
+      <a href="/lang/ru" hreflang="ru" class="lang-inactive">Русский</a>
+    {{ end }}
+    <span class="lang-sep">|</span>
+    {{ if eq .Lang "en" }}
+      <span class="lang-active">English</span>
+    {{ else }}
+      <a href="/lang/en" hreflang="en" class="lang-inactive">English</a>
+    {{ end }}
+  </div>
   <main>{{block "content" .}}{{end}}</main>
 </body>
 </html>
