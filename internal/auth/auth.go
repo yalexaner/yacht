@@ -54,13 +54,17 @@ type dbConn interface {
 // User is the in-memory projection of a users row, hydrated by every login
 // path (widget Verify, token Consume, session Get) and consumed by the
 // middleware's request context. DisplayName and Username can be empty when
-// the underlying row has NULL in those columns.
+// the underlying row has NULL in those columns. Lang is *string so the "not
+// yet picked" state (NULL in the DB) survives the round-trip distinct from
+// an explicit empty preference; the i18n middleware treats nil as "fall
+// through to Accept-Language".
 type User struct {
 	ID          int64
 	TelegramID  int64
 	Username    string
 	DisplayName string
 	IsAdmin     bool
+	Lang        *string
 }
 
 // Error sentinels. Every return site wraps with fmt.Errorf("...: %w", sentinel)
@@ -110,15 +114,15 @@ var (
 // relaxes this to "any allowlisted user" with a different WHERE clause.
 func lookupUserByTelegramID(ctx context.Context, db *sql.DB, telegramID int64) (*User, error) {
 	var (
-		u                          User
-		username, displayName      sql.NullString
-		isAdmin                    int64
+		u                           User
+		username, displayName, lang sql.NullString
+		isAdmin                     int64
 	)
 	err := db.QueryRowContext(ctx, `
-		SELECT id, telegram_id, telegram_username, display_name, is_admin
+		SELECT id, telegram_id, telegram_username, display_name, is_admin, lang
 		FROM users
 		WHERE telegram_id = ?
-	`, telegramID).Scan(&u.ID, &u.TelegramID, &username, &displayName, &isAdmin)
+	`, telegramID).Scan(&u.ID, &u.TelegramID, &username, &displayName, &isAdmin, &lang)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("lookup telegram_id %d: %w", telegramID, ErrUnauthorized)
 	}
@@ -133,5 +137,20 @@ func lookupUserByTelegramID(ctx context.Context, db *sql.DB, telegramID int64) (
 	u.Username = username.String
 	u.DisplayName = displayName.String
 	u.IsAdmin = true
+	u.Lang = nullStringToPtr(lang)
 	return &u, nil
+}
+
+// nullStringToPtr converts a sql.NullString into *string: nil when the
+// column was NULL, a fresh pointer to the string otherwise. Keeps the
+// Scan sites in this package free of boilerplate. Mirrors the helper of
+// the same name in internal/share/service.go — kept duplicated rather
+// than lifted to a shared util because the two packages are otherwise
+// unrelated and a one-line copy avoids a new import dependency edge.
+func nullStringToPtr(ns sql.NullString) *string {
+	if !ns.Valid {
+		return nil
+	}
+	s := ns.String
+	return &s
 }

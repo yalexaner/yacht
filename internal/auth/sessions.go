@@ -104,17 +104,17 @@ func createSession(
 //     path honest regardless).
 func GetSession(ctx context.Context, db *sql.DB, sessionID string) (*User, error) {
 	var (
-		u                     User
-		expiresAt             int64
-		username, displayName sql.NullString
-		isAdmin               int64
+		u                           User
+		expiresAt                   int64
+		username, displayName, lang sql.NullString
+		isAdmin                     int64
 	)
 	err := db.QueryRowContext(ctx, `
-		SELECT s.user_id, s.expires_at, u.telegram_id, u.telegram_username, u.display_name, u.is_admin
+		SELECT s.user_id, s.expires_at, u.telegram_id, u.telegram_username, u.display_name, u.is_admin, u.lang
 		FROM sessions s
 		JOIN users u ON s.user_id = u.id
 		WHERE s.id = ?
-	`, sessionID).Scan(&u.ID, &expiresAt, &u.TelegramID, &username, &displayName, &isAdmin)
+	`, sessionID).Scan(&u.ID, &expiresAt, &u.TelegramID, &username, &displayName, &isAdmin, &lang)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("get session: %w", ErrSessionNotFound)
 	}
@@ -136,6 +136,7 @@ func GetSession(ctx context.Context, db *sql.DB, sessionID string) (*User, error
 	u.Username = username.String
 	u.DisplayName = displayName.String
 	u.IsAdmin = true
+	u.Lang = nullStringToPtr(lang)
 	return &u, nil
 }
 

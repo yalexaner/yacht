@@ -67,9 +67,20 @@ func TestLookupUserByTelegramID(t *testing.T) {
 		adminTG    int64 = 1001
 		nonAdminTG int64 = 1002
 		missingTG  int64 = 9999
+		ruAdminTG  int64 = 1003
 	)
 	adminID := insertTestUser(t, handle, adminTG, true)
 	insertTestUser(t, handle, nonAdminTG, false)
+
+	// plant an admin with lang already set so we can confirm the SELECT
+	// surfaces the column value through to the User struct.
+	ruAdminID := insertTestUser(t, handle, ruAdminTG, true)
+	if _, err := handle.ExecContext(
+		context.Background(),
+		`UPDATE users SET lang = ? WHERE id = ?`, "ru", ruAdminID,
+	); err != nil {
+		t.Fatalf("set lang on admin: %v", err)
+	}
 
 	t.Run("admin row returns user", func(t *testing.T) {
 		got, err := lookupUserByTelegramID(context.Background(), handle, adminTG)
@@ -90,6 +101,22 @@ func TestLookupUserByTelegramID(t *testing.T) {
 		}
 		if !got.IsAdmin {
 			t.Error("IsAdmin = false, want true")
+		}
+		if got.Lang != nil {
+			t.Errorf("Lang = %q (ptr non-nil), want nil for unset column", *got.Lang)
+		}
+	})
+
+	t.Run("admin row with lang set returns lang on user", func(t *testing.T) {
+		got, err := lookupUserByTelegramID(context.Background(), handle, ruAdminTG)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Lang == nil {
+			t.Fatal("Lang = nil, want non-nil pointing at \"ru\"")
+		}
+		if *got.Lang != "ru" {
+			t.Errorf("Lang = %q, want %q", *got.Lang, "ru")
 		}
 	})
 

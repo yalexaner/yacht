@@ -180,22 +180,22 @@ func (b *BotToken) ConsumeLoginTokenTx(ctx context.Context, tx *sql.Tx, token st
 // *sql.Tx satisfies the parameter without duplicating the SQL.
 func consumeLoginToken(ctx context.Context, conn dbConn, token string) (*User, error) {
 	var (
-		u                     User
-		usedAt                sql.NullInt64
-		expiresAt             int64
-		username, displayName sql.NullString
-		isAdmin               int64
+		u                           User
+		usedAt                      sql.NullInt64
+		expiresAt                   int64
+		username, displayName, lang sql.NullString
+		isAdmin                     int64
 	)
 	// single JOIN mirrors GetSession: one round-trip for both the
 	// token metadata and the user row. Keeps the error branches
 	// linear and the SQL surface small.
 	err := conn.QueryRowContext(ctx, `
 		SELECT lt.user_id, lt.used_at, lt.expires_at,
-		       u.telegram_id, u.telegram_username, u.display_name, u.is_admin
+		       u.telegram_id, u.telegram_username, u.display_name, u.is_admin, u.lang
 		FROM login_tokens lt
 		JOIN users u ON lt.user_id = u.id
 		WHERE lt.token = ?
-	`, token).Scan(&u.ID, &usedAt, &expiresAt, &u.TelegramID, &username, &displayName, &isAdmin)
+	`, token).Scan(&u.ID, &usedAt, &expiresAt, &u.TelegramID, &username, &displayName, &isAdmin, &lang)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("consume login token: %w", ErrTokenNotFound)
 	}
@@ -238,6 +238,7 @@ func consumeLoginToken(ctx context.Context, conn dbConn, token string) (*User, e
 	u.Username = username.String
 	u.DisplayName = displayName.String
 	u.IsAdmin = true
+	u.Lang = nullStringToPtr(lang)
 	return &u, nil
 }
 

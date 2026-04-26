@@ -347,6 +347,10 @@ func TestMigrate_SchemaMatchesSPEC(t *testing.T) {
 			{"display_name", "TEXT", false, nil, 0},
 			{"is_admin", "INTEGER", true, strp("0"), 0},
 			{"created_at", "INTEGER", true, nil, 0},
+			// added by 002_users_lang.sql; nullable to preserve "not yet
+			// chosen" for legacy rows so the i18n middleware falls through
+			// to Accept-Language for them.
+			{"lang", "TEXT", false, nil, 0},
 		},
 		"shares": {
 			{"id", "TEXT", false, nil, 1},

@@ -113,6 +113,41 @@ func TestGetSession_HappyPath(t *testing.T) {
 	if !got.IsAdmin {
 		t.Error("IsAdmin = false, want true")
 	}
+	if got.Lang != nil {
+		t.Errorf("Lang = %q (ptr non-nil), want nil for unset column", *got.Lang)
+	}
+}
+
+// TestGetSession_LangPropagated pins that the join SELECT picks up
+// users.lang and threads it through to the *User the middleware sees.
+// Without the column on the SELECT list, /lang/* writes would be invisible
+// to logged-in requests until cache or restart.
+func TestGetSession_LangPropagated(t *testing.T) {
+	handle := newTestDB(t)
+	ctx := context.Background()
+
+	userID := insertTestUser(t, handle, 2006, true)
+	if _, err := handle.ExecContext(ctx,
+		`UPDATE users SET lang = ? WHERE id = ?`, "ru", userID,
+	); err != nil {
+		t.Fatalf("set lang: %v", err)
+	}
+
+	id, err := CreateSession(ctx, handle, userID, "telegram_widget", time.Hour)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	got, err := GetSession(ctx, handle, id)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.Lang == nil {
+		t.Fatal("Lang = nil, want non-nil pointing at \"ru\"")
+	}
+	if *got.Lang != "ru" {
+		t.Errorf("Lang = %q, want %q", *got.Lang, "ru")
+	}
 }
 
 func TestGetSession_NotFound(t *testing.T) {
