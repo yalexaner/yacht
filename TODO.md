@@ -210,23 +210,23 @@
 ## Phase 11: i18n
 
 ### Infrastructure
-- [ ] `internal/i18n/i18n.go` — translation map, `T(lang, key)` with English fallback
-- [ ] `internal/web/middleware/lang.go` — pick language per request (cookie → Accept-Language → default)
-- [ ] Stuff `Lang` into template context
-- [ ] Register `T` as template function
+- [x] `internal/i18n/i18n.go` — translation map, `T(lang, key)` with English fallback
+- [x] `internal/web/middleware/lang.go` — pick language per request (cookie → Accept-Language → default)
+- [x] Stuff `Lang` into template context
+- [x] Register `T` as template function
 
 ### Switcher
-- [ ] Top-right component in base template
-- [ ] CSS: active bold + full opacity, inactive 55%, separator 30%
-- [ ] Route `GET /lang/{code}` → set cookie → redirect to Referer
-- [ ] `hreflang` attributes on inactive links
+- [x] Top-right component in base template
+- [x] CSS: active bold + full opacity, inactive 55%, separator 30%
+- [x] Route `GET /lang/{code}` → set cookie → redirect to Referer
+- [x] `hreflang` attributes on inactive links
 
 ### Russian translations
-- [ ] All page titles
-- [ ] All UI labels (buttons, form fields, links)
-- [ ] All error messages
-- [ ] Login page warning (text drafted in SPEC)
-- [ ] Bot replies (greeting, errors, share-created confirmation)
+- [x] All page titles
+- [x] All UI labels (buttons, form fields, links)
+- [x] All error messages
+- [x] Login page warning (text drafted in SPEC)
+- [x] Bot replies (greeting, errors, share-created confirmation)
 
 ---
 
